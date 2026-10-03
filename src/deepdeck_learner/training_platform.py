@@ -141,8 +141,10 @@ def load_training_settings(root: Path, model_id: str) -> dict[str, Any]:
             saved.get("evaluationGamesPerScenario", evaluation.get("gamesPerScenario", 1))
         ),
         "stages": {
-            "worldModel": bool(stages.get("worldModel", architecture == "v13")),
-            "reinforcementLearning": bool(stages.get("reinforcementLearning", True)),
+            "worldModel": bool(stages.get("worldModel", architecture in {"v13", "v15"})),
+            "reinforcementLearning": bool(
+                stages.get("reinforcementLearning", architecture != "v15")
+            ),
             "engineEvaluation": bool(
                 stages.get(
                     "engineEvaluation",
@@ -227,8 +229,10 @@ def save_training_settings(root: Path, model_id: str, payload: dict[str, Any]) -
             100_000_000,
         ),
     }
-    if architecture == "v13" and stages["worldModel"] and targets["worldModelSteps"] < 1:
+    if architecture in {"v13", "v15"} and stages["worldModel"] and targets["worldModelSteps"] < 1:
         raise ValueError("worldModelSteps must be positive while the world-model stage is enabled")
+    if architecture == "v15" and stages["reinforcementLearning"]:
+        raise ValueError("V15 plan-level reinforcement learning is not implemented yet.")
     if (
         architecture == "v13"
         and stages["reinforcementLearning"]

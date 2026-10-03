@@ -69,8 +69,8 @@ def alexios_config() -> AgentConfig:
 
 
 def deep_learning_config(version: str) -> AgentConfig:
-    if version not in {"v11", "v12", "v13"}:
-        raise ValueError("deep learning version must be v11, v12 or v13")
+    if version not in {"v11", "v12", "v13", "v15"}:
+        raise ValueError("deep learning version must be v11, v12, v13 or v15")
     default_id = f"com.deepdeckleague.example.{version}"
     return AgentConfig(
         agent_id=os.getenv("DEEPDECK_AGENT_ID", default_id).strip(),
@@ -81,6 +81,7 @@ def deep_learning_config(version: str) -> AgentConfig:
             "v11": "Trainable V11 recurrent multiplayer policy example.",
             "v12": "Trainable V12 recurrent two-player zero-sum policy example.",
             "v13": "Trainable V13 structured world-model two-player policy.",
+            "v15": "Trainable V15 typed-latent conditional planning policy.",
         }[version],
         formats=("legacy", "commander") if version == "v11" else ("legacy",),
         decks=DeckPolicy.all(),

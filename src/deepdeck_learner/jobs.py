@@ -262,13 +262,15 @@ class JobManager:
 
     def prepare_model(self, raw: dict[str, Any]) -> str:
         model = str(raw.get("model", "v12"))
-        if model not in {"v11", "v12", "v13"}:
-            raise JobValidationError("Model must be v11, v12, or v13.")
+        if model not in {"v11", "v12", "v13", "v15"}:
+            raise JobValidationError("Model must be v11, v12, v13, or v15.")
         self._local_model_name(raw)
         self._bounded_int(raw, "parallel_matches", default=1, minimum=1, maximum=32)
         self._bounded_int(raw, "gpu_memory_mb", default=0, minimum=0, maximum=24 * 1024)
         if model == "v13":
             return self._prepare_v13_model(raw)
+        if model == "v15":
+            return self._prepare_v15_model(raw)
         _, _, run = self._pool_training_command(model, raw)
         control = run / "training-control.json"
         control.write_text(
@@ -336,6 +338,75 @@ class JobManager:
                 "arguments": ["v13"],
                 "checkpointArgument": "--checkpoint",
                 "requiredFiles": ["rl-model.pt"],
+            },
+        }
+        (run / "local-model.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (run / "training-control.json").write_text(
+            json.dumps({"desiredState": "paused"}, indent=2) + "\n", encoding="utf-8"
+        )
+        return model_id
+
+    def _prepare_v15_model(self, raw: dict[str, Any]) -> str:
+        try:
+            import yaml
+        except ModuleNotFoundError as error:
+            raise JobValidationError(
+                "Install DeepDeckLearner's deep-learning dependencies."
+            ) from error
+        model_name = self._local_model_name(raw)
+        now = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+        slug = re.sub(r"[^a-z0-9]+", "-", model_name.casefold()).strip("-") or "v15-agent"
+        model_id = f"{slug[:40]}-{now.lower()}"
+        run = self.root / ".deepdeck" / "runs" / f"{now}-{slug[:40]}-v15"
+        run.mkdir(parents=True, exist_ok=False)
+        template = self.root / "configs" / "oracle-ai" / "v15-typed-latent-smoke.yaml"
+        if not template.is_file():
+            raise JobValidationError("The V15 typed-latent configuration is unavailable.")
+        config = yaml.safe_load(template.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise JobValidationError("The V15 typed-latent configuration is invalid.")
+        config["name"] = model_name
+        config["outputDir"] = str(run)
+        training = config.setdefault("training", {})
+        training["seed"] = self._random_seed()
+        training["steps"] = self._bounded_int(
+            raw, "training_steps", default=1000, minimum=1, maximum=1_000_000
+        )
+        config_path = run / "training-config.yaml"
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        resource_plan = {
+            "trainingMatches": 1,
+            "leagueMatches": 0,
+            "localMatches": 1,
+            "gpuMemoryMb": self._bounded_int(
+                raw, "gpu_memory_mb", default=0, minimum=0, maximum=24 * 1024
+            ),
+        }
+        (run / "learner-resources.json").write_text(
+            json.dumps(resource_plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        checkpoint = run / "checkpoints" / f"step-{training['steps']}"
+        metadata = {
+            "schemaVersion": "local-model/v1",
+            "id": model_id,
+            "name": model_name,
+            "architecture": "v15",
+            "format": "legacy",
+            "description": "V15 typed-latent conditional planning agent.",
+            "createdAt": utc_now(),
+            "checkpointPath": str(checkpoint),
+            "reservePlaytest": True,
+            "selfPlayAllSeats": False,
+            "source": "user-trained",
+            "decks": [],
+            "resourcePlan": resource_plan,
+            "agentSdkRuntime": {
+                "module": "deepdeck_examples.run",
+                "arguments": ["v15"],
+                "checkpointArgument": "--checkpoint",
+                "requiredFiles": ["v15-model.pt"],
             },
         }
         (run / "local-model.json").write_text(
@@ -1109,6 +1180,28 @@ class JobManager:
             ) from error
         if not isinstance(config, dict):
             raise JobValidationError("This agent's training configuration is invalid.")
+        if str(metadata.get("architecture", "")).casefold() == "v15":
+            if requested_phase not in {None, "world-model", "typed-latent-world-model"}:
+                raise JobValidationError(
+                    f"V15 does not publish a training phase named {requested_phase}."
+                )
+            (run / "training-control.json").write_text(
+                json.dumps({"desiredState": "running"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    "oracle_ai.training.world_model_v15",
+                    "--config",
+                    str(config_path),
+                    "--output",
+                    str(run),
+                ],
+                f"{metadata.get('name', model_id)} · V15 · typed latent world model",
+                run,
+            )
         if str(metadata.get("architecture", "")).casefold() == "v13":
             supported_phases = {
                 "world-model",

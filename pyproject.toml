@@ -48,6 +48,7 @@ oracle-ai-ground-truth-eval = "oracle_ai.ground_truth_cli:main"
 oracle-ai-calibrate-anchors = "oracle_ai.training.anchor_calibration:main"
 oracle-ai-v12-clients = "oracle_ai.agents.v12_clients:main"
 oracle-ai-v13-world-model = "oracle_ai.training.world_model:main"
+oracle-ai-v15-world-model = "oracle_ai.training.world_model_v15:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deepdeck_examples", "src/deepdeck_learner", "src/oracle_ai"]

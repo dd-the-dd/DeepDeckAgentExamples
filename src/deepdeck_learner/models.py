@@ -43,13 +43,18 @@ def _training_state(run: Path) -> dict[str, Any]:
     try:
         value = json.loads((run / "league-state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        try:
-            value = json.loads((run / "v13-training-state.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        value = None
+        for name in ("v15-training-state.json", "v13-training-state.json"):
+            try:
+                value = json.loads((run / name).read_text(encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                continue
+        if value is None:
             return {}
     if not isinstance(value, dict):
         return {}
-    if "step" in value:
+    if "step" in value and "trainingStep" not in value:
         return {
             "phase": "world-model",
             "desiredState": value.get("status", "stopped"),
@@ -443,12 +448,17 @@ def training_statistics(root: Path, metric_window: str = "200") -> list[dict[str
         training_path = run / "training.jsonl"
         v13_training_path = run / "v13-metrics.jsonl"
         v13_rl_training_path = run / "v13-rl-metrics.jsonl"
-        is_v13 = str(metadata.get("architecture", "")).casefold() == "v13"
+        architecture = str(metadata.get("architecture", "")).casefold()
+        is_v13 = architecture == "v13"
+        is_v15 = architecture == "v15"
         if is_v13:
             training_path = (
                 v13_rl_training_path if v13_rl_training_path.is_file() else v13_training_path
             )
+        elif is_v15:
+            training_path = run / "v15-metrics.jsonl"
         is_v13_world_model = is_v13 and training_path == v13_training_path
+        is_latent_world_model = is_v13_world_model or is_v15
         if training_path.is_file():
             try:
                 lines = training_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -503,7 +513,7 @@ def training_statistics(root: Path, metric_window: str = "200") -> list[dict[str
         for record in plotted_records:
             raw_ppo = record.get("ppo")
             ppo: dict[str, Any] = raw_ppo if isinstance(raw_ppo, dict) else {}
-            source = record if is_v13 else ppo
+            source = record if is_v13 or is_v15 else ppo
             losses = {
                 key: value
                 for key, value in source.items()
@@ -534,6 +544,15 @@ def training_statistics(root: Path, metric_window: str = "200") -> list[dict[str
                     state = v13_state
             except (OSError, ValueError):
                 pass
+        elif is_v15:
+            try:
+                v15_state = json.loads(
+                    (run / "v15-training-state.json").read_text(encoding="utf-8")
+                )
+                if isinstance(v15_state, dict):
+                    state = v15_state
+            except (OSError, ValueError):
+                pass
         engine_game_count = 0
         if is_v13:
             with suppress(OSError):
@@ -560,7 +579,9 @@ def training_statistics(root: Path, metric_window: str = "200") -> list[dict[str
                 "trainingStep": int(state.get("trainingStep", state.get("step", 0)) or 0),
                 "parallelGames": int(state.get("parallelGameWorkers", 0) or 0),
                 "activeGames": len(active_attempts) if isinstance(active_attempts, list) else 0,
-                "phase": state.get("trainingPhase", "world-model" if is_v13 else "not-started"),
+                "phase": state.get(
+                    "trainingPhase", "world-model" if is_v13 or is_v15 else "not-started"
+                ),
                 "desiredState": state.get("desiredState", state.get("status", "stopped")),
                 "trainingElapsedSeconds": float(state.get("trainingElapsedSeconds", 0) or 0),
                 "simulationSeconds": float(state.get("gameSimulationSeconds", 0) or 0),
@@ -570,7 +591,7 @@ def training_statistics(root: Path, metric_window: str = "200") -> list[dict[str
                 "metricRecordCount": len(records),
                 "metricPointsReturned": len(latest_metrics),
                 "windowSummary": _window_summary(
-                    production_records, is_v13_world_model=is_v13_world_model
+                    production_records, is_v13_world_model=is_latent_world_model
                 ),
                 "latestMetrics": latest_metrics,
                 "updatedAtUnixMs": state.get("updatedAtUnixMs"),

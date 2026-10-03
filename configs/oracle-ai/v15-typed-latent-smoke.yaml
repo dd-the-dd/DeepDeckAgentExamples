@@ -1,0 +1,22 @@
+outputDir: .deepdeck/runs/v15-typed-latent-smoke
+model:
+  node_feature_dim: 32
+  latent_dim: 128
+  tactical_dim: 96
+  strategic_dim: 64
+  heads: 4
+  graph_layers: 2
+  action_dim: 32
+  target_dim: 32
+  effect_dim: 32
+  invariant_dim: 16
+  reconstruction_sample_rate: 0.05
+  max_plan_nodes: 8
+  max_plan_branches: 2
+training:
+  steps: 100
+  batch_size: 8
+  nodes: 24
+  learning_rate: 0.0003
+  checkpoint_every: 25
+  seed: 15

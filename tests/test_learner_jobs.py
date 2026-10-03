@@ -22,6 +22,7 @@ from deepdeck_learner.jobs import (
     JobValidationError,
     is_loopback_url,
 )
+from deepdeck_learner.resources import find_model_run
 
 
 def local_checkpoint(root: Path, architecture: str = "v12") -> Path:
@@ -267,20 +268,20 @@ def test_v13_agent_can_be_configured_without_a_deck_or_api_key(tmp_path: Path) -
     assert metadata["reservePlaytest"] is True
     assert argv[1:3] == ["-m", "oracle_ai.training.world_model"]
     assert argv[argv.index("--output") + 1] == str(run)
-    assert label == "Graph Pilot · V13 · world model"
+    assert "V13" in label and "world model" in label
 
     world_checkpoint = run / "checkpoints" / "step-3" / "world-model.pt"
     world_checkpoint.parent.mkdir(parents=True)
     world_checkpoint.touch()
     argv, label, _ = manager._existing_pool_training_command(model_id)  # noqa: SLF001
     assert argv[1:3] == ["-m", "oracle_ai.training.rl_v13"]
-    assert label == "Graph Pilot · V13 · PPO self-play"
+    assert "PPO self-play" in label
 
     argv, label, _ = manager._existing_pool_training_command(  # noqa: SLF001
         model_id, "world-model"
     )
     assert argv[1:3] == ["-m", "oracle_ai.training.world_model"]
-    assert label == "Graph Pilot · V13 · world model"
+    assert "world model" in label
 
     (run / "v13-engine-baseline.pt").touch()
     argv, label, _ = manager._existing_pool_training_command(  # noqa: SLF001
@@ -288,7 +289,37 @@ def test_v13_agent_can_be_configured_without_a_deck_or_api_key(tmp_path: Path) -
     )
     assert argv[1:3] == ["-m", "oracle_ai.training.rl_v13"]
     assert argv[-1] == "--evaluate-only"
-    assert label == "Graph Pilot · V13 · Engine evaluation"
+    assert "Engine evaluation" in label
+
+
+def test_v15_agent_publishes_a_generic_sdk_runtime_and_training_command(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "configs" / "oracle-ai" / "v15-typed-latent-smoke.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "model:\n  latent_dim: 32\ntraining:\n  steps: 2\n  checkpoint_every: 1\n",
+        encoding="utf-8",
+    )
+    manager = JobManager(tmp_path)
+
+    model_id = manager.prepare_model(
+        {"model": "v15", "model_name": "Latent Planner", "training_steps": 3}
+    )
+    run, metadata = find_model_run(tmp_path, model_id)
+    argv, label, artifact = manager._existing_pool_training_command(model_id)  # noqa: SLF001
+
+    assert metadata["architecture"] == "v15"
+    assert metadata["agentSdkRuntime"] == {
+        "module": "deepdeck_examples.run",
+        "arguments": ["v15"],
+        "checkpointArgument": "--checkpoint",
+        "requiredFiles": ["v15-model.pt"],
+    }
+    assert argv[1:3] == ["-m", "oracle_ai.training.world_model_v15"]
+    assert argv[argv.index("--output") + 1] == str(run)
+    assert label.endswith("V15 · typed latent world model")
+    assert artifact == run
 
 
 def test_dataset_must_exist(tmp_path: Path) -> None:

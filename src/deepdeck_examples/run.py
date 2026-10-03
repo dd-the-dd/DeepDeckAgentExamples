@@ -55,6 +55,7 @@ def parser() -> argparse.ArgumentParser:
             "v11",
             "v12",
             "v13",
+            "v15",
         ),
         default=os.getenv("DEEPDECK_EXAMPLE", "alexios"),
     )
@@ -76,12 +77,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--checkpoint",
         default=os.getenv("DEEPDECK_CHECKPOINT"),
-        help="V11/V12 checkpoint directory, or a V13 directory containing rl-model.pt.",
+        help=(
+            "V11/V12 checkpoint directory, V13 directory containing rl-model.pt, "
+            "or V15 directory containing v15-model.pt."
+        ),
     )
     result.add_argument(
         "--device",
         default=os.getenv("DEEPDECK_DEVICE", "cpu"),
-        help="PyTorch device used by V11/V12/V13, for example cpu or cuda.",
+        help="PyTorch device used by V11/V12/V13/V15, for example cpu or cuda.",
     )
     result.add_argument(
         "--allow-untrained",
@@ -166,6 +170,16 @@ def _agent_and_config(arguments: argparse.Namespace) -> tuple[Agent, AgentConfig
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise SystemExit(str(error)) from error
         return v13_agent, deep_learning_config("v13")
+    if arguments.example == "v15":
+        if not arguments.checkpoint:
+            raise SystemExit("V15 requires --checkpoint")
+        try:
+            from .v15_agent import load_v15_agent
+
+            v15_agent = load_v15_agent(arguments.checkpoint, device=arguments.device)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+        return v15_agent, deep_learning_config("v15")
     if is_oracle_checkpoint(arguments.checkpoint):
         return (
             OracleCheckpointAgent(arguments.checkpoint, device=arguments.device),
