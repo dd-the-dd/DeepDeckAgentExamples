@@ -361,7 +361,7 @@ class JobManager:
         model_id = f"{slug[:40]}-{now.lower()}"
         run = self.root / ".deepdeck" / "runs" / f"{now}-{slug[:40]}-v15"
         run.mkdir(parents=True, exist_ok=False)
-        template = self.root / "configs" / "oracle-ai" / "v15-typed-latent-smoke.yaml"
+        template = self.root / "configs" / "oracle-ai" / "v15-typed-latent-engine.yaml"
         if not template.is_file():
             raise JobValidationError("The V15 typed-latent configuration is unavailable.")
         config = yaml.safe_load(template.read_text(encoding="utf-8"))
@@ -1939,8 +1939,7 @@ class JobManager:
                 job.logs.append(line.rstrip())
             return source.tell()
 
-    @staticmethod
-    def _child_environment() -> dict[str, str]:
+    def _child_environment(self) -> dict[str, str]:
         allowed = {
             "PATH",
             "Path",
@@ -1961,7 +1960,13 @@ class JobManager:
             "DEEPDECK_PLATFORM_URL",
             "DDL_PLATFORM_API_URL",
         }
-        return {key: value for key, value in os.environ.items() if key in allowed}
+        environment = {key: value for key, value in os.environ.items() if key in allowed}
+        sdk_source = str((self.root / "external" / "deepdeck-agent" / "src").resolve())
+        existing = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = (
+            sdk_source if not existing else os.pathsep.join((sdk_source, existing))
+        )
+        return environment
 
     @staticmethod
     def _engine_environment() -> dict[str, str]:

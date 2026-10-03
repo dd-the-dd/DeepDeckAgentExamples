@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -295,7 +296,7 @@ def test_v13_agent_can_be_configured_without_a_deck_or_api_key(tmp_path: Path) -
 def test_v15_agent_publishes_a_generic_sdk_runtime_and_training_command(
     tmp_path: Path,
 ) -> None:
-    config = tmp_path / "configs" / "oracle-ai" / "v15-typed-latent-smoke.yaml"
+    config = tmp_path / "configs" / "oracle-ai" / "v15-typed-latent-engine.yaml"
     config.parent.mkdir(parents=True)
     config.write_text(
         "model:\n  latent_dim: 32\ntraining:\n  steps: 2\n  checkpoint_every: 1\n",
@@ -719,9 +720,9 @@ def test_transform_planeswalker_face_keeps_starting_loyalty(
                                 "name": "Tamiyo, Seasoned Scholar",
                                 "type_line": "Legendary Planeswalker - Tamiyo",
                                 "mana_cost": "",
-                                    "oracle_text": (
-                                        "+2: Until your next turn, attacking creatures get -1/-0."
-                                    ),
+                                "oracle_text": (
+                                    "+2: Until your next turn, attacking creatures get -1/-0."
+                                ),
                                 "loyalty": "2",
                             },
                         ],
@@ -740,8 +741,7 @@ def test_transform_planeswalker_face_keeps_starting_loyalty(
                 "scryfallId": "tamiyo",
                 "name": "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar",
                 "typeLine": (
-                    "Legendary Creature - Moonfolk Wizard // "
-                    "Legendary Planeswalker - Tamiyo"
+                    "Legendary Creature - Moonfolk Wizard // Legendary Planeswalker - Tamiyo"
                 ),
                 "imageBackUri": "https://example.test/tamiyo-back.jpg",
             }
@@ -851,6 +851,8 @@ def test_matchmaking_uses_selected_catalog_values_without_exposing_ids_in_ui(
     assert argv[argv.index("--checkpoint") + 1] == str(checkpoint)
     assert "--once" in argv
     assert manager._child_environment()["DEEPDECK_API_KEY"] == "ddl_agent_test"  # noqa: SLF001
+    sdk_source = manager._child_environment()["PYTHONPATH"].split(os.pathsep)[0]  # noqa: SLF001
+    assert Path(sdk_source) == (tmp_path / "external" / "deepdeck-agent" / "src").resolve()
 
 
 def test_matchmaking_coerces_unsupported_deep_learning_speed(

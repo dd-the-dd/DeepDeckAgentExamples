@@ -29,11 +29,11 @@ The planning adapter maintains a `PlanGraph`, accumulates ordered events, reques
 `KEEP`, `ADVANCE`, `PATCH`, or `REPLAN`, and binds semantic intentions only to exact
 actions offered by the Engine.
 
-The SDK protocol also accepts an optional game-clock budget with remaining bank,
-increment policy, reserve, and hard deadline. V15 uses that budget to select reflex,
-tactical, or strategic inference. The current Engine does not yet publish or enforce
-this global bank; its existing per-decision deadline remains authoritative until the
-Engine clock protocol is implemented.
+The Engine owns the optional chess-style decision clock. It charges wall-clock time,
+applies the increment once per turn (never once per priority exchange), publishes the
+remaining bank, reserve, delay, and hard deadline to the SDK, and records a loss with
+reason `time` when the bank reaches zero. V15 only uses this read-only budget to select
+reflex, tactical, or strategic inference.
 
 ## Training and current limit
 
@@ -44,10 +44,18 @@ python -m oracle_ai.training.world_model_v15 `
   --config configs/oracle-ai/v15-typed-latent-smoke.yaml
 ```
 
-It writes `v15-metrics.jsonl`, `v15-training-state.json`, and resumable-style
-`checkpoints/step-N/v15-model.pt` artifacts. The synthetic generator validates the
-architecture and training path; it is not evidence of Magic competence. Production
-training requires observer-safe Engine traces segmented at cost, announcement, response,
-resolution, and rules-closure boundaries. Plan-level reinforcement learning is
-deliberately disabled until those transition targets exist.
+Run training on authoritative Engine replays with:
 
+```powershell
+python -m oracle_ai.training.world_model_v15 `
+  --config configs/oracle-ai/v15-typed-latent-engine.yaml
+```
+
+It writes `v15-metrics.jsonl`, `v15-training-state.json`, and resumable-style
+`checkpoints/step-N/v15-model.pt` artifacts. The synthetic generator is enabled only by
+`synthetic_smoke: true` and validates the architecture, not Magic competence. The
+production configuration `v15-typed-latent-engine.yaml` consumes actions and consecutive
+authoritative states from Engine replay frames. It aligns nodes by stable identity and
+derives typed cost, announcement, response, resolution, and rules-closure targets from
+the observed action/stack boundary. Plan-level reinforcement learning remains separate
+so it cannot overwrite the action-effect or legality world model.

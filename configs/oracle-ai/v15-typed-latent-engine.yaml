@@ -1,4 +1,4 @@
-outputDir: .deepdeck/runs/v15-typed-latent-smoke
+outputDir: .deepdeck/runs/v15-typed-latent-engine
 model:
   node_feature_dim: 32
   latent_dim: 128
@@ -14,10 +14,14 @@ model:
   max_plan_nodes: 8
   max_plan_branches: 2
 training:
-  synthetic_smoke: true
-  steps: 100
-  batch_size: 8
+  steps: 10000
+  batch_size: 4
   nodes: 24
   learning_rate: 0.0003
-  checkpoint_every: 25
+  checkpoint_every: 250
   seed: 15
+  replay_paths:
+    - .deepdeck/runs/*/replays/episode-*.json
+  max_replay_files: 2
+  max_transitions: 256
+  synthetic_smoke: false

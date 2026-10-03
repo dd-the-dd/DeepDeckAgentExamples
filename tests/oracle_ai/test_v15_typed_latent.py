@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 
 from oracle_ai.model_v15 import (
@@ -11,9 +14,80 @@ from oracle_ai.model_v15 import (
 )
 from oracle_ai.training.world_model_v15 import (
     V15TrainingConfig,
+    load_replay_transitions,
     synthetic_transition_batch,
     train,
 )
+
+
+def test_v15_trains_from_engine_replay_transitions(tmp_path: Path) -> None:
+    replay = tmp_path / "episode.json"
+    replay.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "decision": {"playerId": "player-1"},
+                        "selectedAction": {"id": "play", "kind": "playLand"},
+                        "state": {
+                            "turnNumber": 1,
+                            "step": "precombatMain",
+                            "stack": [],
+                            "players": [{"id": "player-1", "life": 20}],
+                        },
+                    },
+                    {
+                        "decision": {"playerId": "player-2"},
+                        "state": {
+                            "turnNumber": 1,
+                            "step": "precombatMain",
+                            "stack": [],
+                            "players": [{"id": "player-1", "life": 20}],
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    transitions = load_replay_transitions([str(replay)], _config(), 10)
+
+    assert len(transitions) == 1
+    assert transitions[0].legal_label.tolist() == [1.0]
+
+    output = tmp_path / "engine-run"
+    config = tmp_path / "v15-engine.yaml"
+    config.write_text(
+        f"""outputDir: {output.as_posix()}
+model:
+  node_feature_dim: 12
+  latent_dim: 24
+  tactical_dim: 16
+  strategic_dim: 12
+  heads: 4
+  graph_layers: 1
+  action_dim: 32
+  effect_dim: 12
+  invariant_dim: 8
+  text_max_tokens: 16
+training:
+  steps: 1
+  batch_size: 1
+  checkpoint_every: 1
+  replay_paths:
+    - {json.dumps(replay.as_posix())}
+  synthetic_smoke: false
+""",
+        encoding="utf-8",
+    )
+
+    checkpoint = train(config)
+    metrics = json.loads((output / "v15-metrics.jsonl").read_text(encoding="utf-8"))
+
+    assert (checkpoint / "v15-model.pt").is_file()
+    assert metrics["dataSource"] == "engine-replay"
+    assert metrics["availableTransitions"] == 1
 
 
 def _config() -> ModelConfigV15:
@@ -104,7 +178,7 @@ def test_v15_uses_different_operators_for_cost_and_resolution() -> None:
     assert not torch.allclose(cost, resolution)
 
 
-def test_v15_trainer_writes_a_playable_checkpoint_and_metrics(tmp_path) -> None:
+def test_v15_trainer_writes_a_playable_checkpoint_and_metrics(tmp_path: Path) -> None:
     config = tmp_path / "v15.yaml"
     output = tmp_path / "run"
     config.write_text(
@@ -121,6 +195,7 @@ model:
   invariant_dim: 4
   text_max_tokens: 8
 training:
+  synthetic_smoke: true
   steps: 1
   batch_size: 2
   nodes: 4
