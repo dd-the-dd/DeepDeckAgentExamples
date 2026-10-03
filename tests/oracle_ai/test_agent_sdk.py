@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -40,6 +43,19 @@ def test_manifest_is_typed_and_serializes_the_rust_contract() -> None:
         "full-observation-stream",
         "delta-event-stream",
     ]
+
+
+def test_maximal_manifest_matches_the_shared_agent_contract_fixture() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "agent_manifest_v1_maximal.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+
+    serialized = AgentManifest.model_validate(payload).model_dump(
+        by_alias=True,
+        mode="json",
+        exclude_none=True,
+    )
+
+    assert serialized == payload
 
 
 def test_allow_list_requires_a_deck() -> None:

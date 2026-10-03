@@ -95,6 +95,16 @@ class AgentManifest(ProtocolModel):
     name: str = Field(min_length=1)
     version: str = Field(min_length=1)
     description: str = ""
+    agent_type: Literal[
+        "deep_learning",
+        "reinforcement_learning",
+        "alpha_star",
+        "rules_engine",
+        "search",
+        "hybrid",
+        "human_ui",
+        "other",
+    ] = "other"
     authors: list[AgentAuthor] = Field(min_length=1)
     repository: AgentRepository | None = None
     publications: list[ScientificPublication] = Field(default_factory=list)
