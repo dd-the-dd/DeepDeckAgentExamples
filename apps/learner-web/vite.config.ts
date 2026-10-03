@@ -5,6 +5,12 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   plugins: [react(), vue()],
+  build: {
+    // The local workbench can be rebuilt while an Engine game is open. Keep
+    // content-hashed chunks from the previous build so an existing tab can
+    // still finish loading its lazy Pixi modules.
+    emptyOutDir: false,
+  },
   resolve: {
     alias: [
       {

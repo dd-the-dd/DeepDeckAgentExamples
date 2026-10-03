@@ -120,6 +120,8 @@ def active_games(root: Path, jobs: list[Any]) -> list[dict[str, Any]]:
     for metadata_path in (root / ".deepdeck" / "runs").glob("*/local-model.json"):
         metadata = _json_object(metadata_path)
         state = _json_object(metadata_path.parent / "league-state.json")
+        if not state:
+            state = _json_object(metadata_path.parent / "v13-training-state.json")
         attached = any(
             _job_value(job, "kind") == "training.pool"
             and _job_value(job, "model_id") == metadata.get("id")
@@ -394,14 +396,21 @@ def resource_snapshot(root: Path, jobs: list[Any]) -> dict[str, Any]:
         model_id = str(metadata.get("id", ""))
         model_name = str(metadata.get("name", model_id))
         run_text = str(metadata_path.parent.resolve()).casefold()
-        checkpoint_text = str(Path(str(metadata.get("checkpointPath", ""))).resolve()).casefold()
+        checkpoint_value = str(metadata.get("checkpointPath", "")).strip()
+        checkpoint_text = (
+            str(Path(checkpoint_value).resolve()).casefold() if checkpoint_value else ""
+        )
         for candidate, command in top_level_processes:
             if candidate.pid in claimed_pids:
                 continue
             if "oracle_ai.training.league" in command and run_text in command:
                 kind = "training.pool"
                 slots = load_resource_plan(metadata_path.parent)["trainingMatches"]
-            elif "deepdeck_examples.run" in command and checkpoint_text in command:
+            elif (
+                "deepdeck_examples.run" in command
+                and checkpoint_text
+                and checkpoint_text in command
+            ):
                 kind = "playtest.agent" if "--start-local-game" in command else "matchmaking.agent"
                 concurrency = re.search(r"--matchmaking-concurrency(?:=|\s+)(\d+)", command)
                 slots = int(concurrency.group(1)) if concurrency else 1

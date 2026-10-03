@@ -3536,6 +3536,76 @@ def test_rust_environment_submits_the_policy_number_as_one_engine_choice() -> No
     environment.close()
 
 
+def test_rust_environment_submits_card_name_from_the_selected_legal_action() -> None:
+    submitted: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/game/sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": "session:card-name",
+                    "revision": 1,
+                    "state": {},
+                    "decision": {
+                        "id": "name:1",
+                        "kind": "replacementChoice",
+                        "playerId": "learner",
+                        "choice": {
+                            "kind": "cardNameSelection",
+                            "decisionId": "chosenCardName",
+                            "suggestions": ["Brainstorm", "Force of Will"],
+                        },
+                        "options": [
+                            {
+                                "id": "choose:name:0",
+                                "kind": "chooseResolution",
+                                "decisions": {"chosenCardName": ["Brainstorm"]},
+                            },
+                            {
+                                "id": "choose:name:1",
+                                "kind": "chooseResolution",
+                                "decisions": {"chosenCardName": ["Force of Will"]},
+                            },
+                        ],
+                    },
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/actions"):
+            submitted.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": "session:card-name",
+                    "revision": 2,
+                    "state": {"outcome": {"winner": "learner", "losers": []}},
+                },
+            )
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"removed": True})
+        return httpx.Response(404)
+
+    matchup = Matchup(
+        id="card-name",
+        setup={"players": []},
+        learner_player_id="learner",
+        opponent_player_id="opponent",
+    )
+    environment = RustSessionEnvironment("http://engine.test", {matchup.id: matchup})
+    environment.client.close()
+    environment.client = httpx.Client(
+        base_url="http://engine.test",
+        transport=httpx.MockTransport(handler),
+    )
+
+    environment.reset(matchup.id, seed=7, seat_swap=False)
+    environment.step(1)
+
+    assert submitted["actionId"] == "choose:name:1"
+    assert submitted["cardName"] == "Force of Will"
+    environment.close()
+
+
 def test_rust_environment_preserves_a_long_configured_wait_timeout() -> None:
     matchup = Matchup(
         id="long-timeout",
@@ -3632,6 +3702,52 @@ def test_self_play_environment_controls_every_player_and_reports_rewards() -> No
     assert initial.state["_decisionContext"]["playerId"] == "player-2"
     assert terminal.rewards_by_player == {"player-1": -1.0, "player-2": 1.0}
     environment.close()
+
+
+def test_compact_replay_view_preserves_pixi_session_and_stack_shape() -> None:
+    compact = RustSelfPlayEnvironment._compact_replay_view(
+        {
+            "schemaVersion": "mtg-game-session/v1",
+            "revision": 4,
+            "state": {
+                "players": [],
+                "stack": [
+                    {
+                        "id": "stack:1",
+                        "controller": "player-1",
+                        "card": {
+                            "instanceId": "spell:1",
+                            "controller": "player-1",
+                            "owner": "player-1",
+                            "definition": {
+                                "id": "ponder",
+                                "name": "Ponder",
+                                "manaCost": "{U}",
+                                "typeLine": "Sorcery",
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    assert compact["schemaVersion"] == "mtg-game-session/v1"
+    assert compact["state"]["stack"] == [
+        {
+            "id": "stack:1",
+            "controller": "player-1",
+            "card": {
+                "instanceId": "spell:1",
+                "name": "Ponder",
+                "cardId": "ponder",
+                "controllerId": "player-1",
+                "ownerId": "player-1",
+                "manaCost": "{U}",
+                "typeLine": "Sorcery",
+            },
+        }
+    ]
 
 
 def test_self_play_rewards_and_advantages_remain_player_relative() -> None:

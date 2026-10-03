@@ -28,6 +28,19 @@ def test_v11_and_v12_are_available_but_untrained_weights_require_opt_in() -> Non
     assert v12.checkpoint == "checkpoint"
 
 
+def test_v13_is_available_with_an_rl_checkpoint() -> None:
+    v13 = parser().parse_args(["v13", "--target", "local", "--checkpoint", "checkpoint"])
+
+    assert v13.example == "v13"
+    assert v13.checkpoint == "checkpoint"
+
+
+def test_forge_reference_profiles_are_available() -> None:
+    for profile in ("cautious", "balanced", "aggressive"):
+        arguments = parser().parse_args([f"forge-{profile}", "--target", "local"])
+        assert arguments.example == f"forge-{profile}"
+
+
 def test_public_runner_accepts_a_pool_for_concurrent_league_seats() -> None:
     arguments = parser().parse_args(
         [

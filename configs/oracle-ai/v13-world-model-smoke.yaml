@@ -1,0 +1,53 @@
+outputDir: .deepdeck/runs/v13-world-model-smoke
+model:
+  node_feature_dim: 32
+  latent_dim: 128
+  node_type_count: 16
+  player_slots: 2
+  zone_count: 8
+  heads: 4
+  graph_layers: 2
+  stochastic_dim: 32
+  action_dim: 24
+  opponent_actions: 8
+  text_vocabulary_size: 8192
+  text_max_tokens: 128
+  max_sequence_positions: 1024
+training:
+  steps: 250
+  batch_size: 16
+  nodes: 32
+  learning_rate: 0.0003
+  checkpoint_every: 50
+  log_every: 1
+  seed: 13001
+  device: auto
+  resume: true
+rl:
+  episodes: 10000
+  rollout_episodes: 16
+  horizon: 8
+  learning_rate: 0.0001
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  value_coefficient: 0.5
+  entropy_coefficient: 0.01
+  epochs: 4
+  minibatch_size: 64
+  max_grad_norm: 1.0
+  target_kl: 0.02
+  checkpoint_every: 25
+  staging_evaluation_every_updates: 100
+  staging_platform_url: https://staging.deepdeckleague.com/api
+  staging_format: legacy
+  seed: 13013
+  device: auto
+lossWeights:
+  reconstruction_loss: 1.0
+  dynamics_loss: 1.0
+  kl_loss: 0.01
+  belief_loss: 0.25
+  opponent_loss: 0.25
+  search_loss: 0.25
+  value_loss: 0.5

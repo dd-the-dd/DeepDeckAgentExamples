@@ -31,4 +31,14 @@ describe('workflowBlockers', () => {
       'Create your account API key and add it to the project .env.',
     ]);
   });
+
+  it('allows local playtest with healthy locally modified runtimes', () => {
+    const localRuntime = {
+      ...ready,
+      engine: { ...ready.engine, revision: 'newer-local', synced: false, dirty: true },
+      pixi: { ...ready.pixi, revision: 'newer-local', synced: false, dirty: true },
+    };
+
+    expect(workflowBlockers(localRuntime, 'local-playtest')).toEqual([]);
+  });
 });

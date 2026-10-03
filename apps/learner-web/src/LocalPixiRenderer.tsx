@@ -263,13 +263,14 @@ function mountPixi(
   host: HTMLDivElement,
   initialScene: Record<string, unknown>,
   events: PixiEventRefs,
+  mode: "play" | "replay",
 ) {
   const currentScene = shallowRef(initialScene);
   const vue = createApp({
     render: () => h(pixi.PixiGame, {
       brandName: "Deep Deck Learner",
       cardBackUrl: "/api/scryfall-images/back.png",
-      mode: "play",
+      mode,
       scene: currentScene.value,
       onCardClick: (payload: any) => events.card.current(payload),
       onCardHover: (payload: any) => events.hover.current(payload),
@@ -427,13 +428,15 @@ function abstractResolutionLabel(action: any, projection: Projection) {
   return label;
 }
 
-export default function LocalPixiRenderer({ deckSelections, matchup, view, onAction, onExit }: {
+export default function LocalPixiRenderer({ deckSelections, matchup, mode = "play", view, onAction, onExit }: {
   deckSelections: DeckPresentation[];
   matchup: string;
+  mode?: "play" | "replay";
   view: EngineView;
   onAction: (actionId: string, extra?: Record<string, unknown>) => void;
   onExit: () => void;
 }) {
+  const isReplay = mode === "replay";
   const host = useRef<HTMLDivElement>(null);
   const vue = useRef<VueApp<Element> | null>(null);
   const sceneRef = useRef<ShallowRef<Record<string, unknown>> | null>(null);
@@ -513,7 +516,7 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
       (id) => !maximumReached || selectedIds.has(id),
     ));
   }, [activeTargetPlan, cardChoice?.maximum, cardNameChoice, selectedCardIds.length, selectedIds, tableChoiceIds, visibleNameCardIds]);
-  const interaction = useMemo<Interaction>(() => ({
+  const interaction = useMemo<Interaction>(() => isReplay ? { targeting: true } : ({
     orderedIds: selectedCardIds,
     prompt: activeTargetPlan
       ? `${activeTargetPlan.prompt} (${activeTargetPlan.index + 1}/${activeTargetPlan.keys.length})`
@@ -525,15 +528,15 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
     selectedIds,
     targetableIds,
     targeting: Boolean(activeTargetPlan || cardChoice || cardNameChoice),
-  }), [activeTargetPlan, cardChoice, cardNameChoice, selectedCardIds, selectedIds, tableChoiceCards.length, targetableIds]);
+  }), [activeTargetPlan, cardChoice, cardNameChoice, isReplay, selectedCardIds, selectedIds, tableChoiceCards.length, targetableIds]);
   const activeStackPlayback = stackPlaybackQueue[0];
   const scene = useMemo(
     () => sceneWithStackPlayback(
-      pixiScene(projection, interaction),
+      { ...pixiScene(projection, interaction), replay: isReplay },
       projection,
       activeStackPlayback,
     ),
-    [activeStackPlayback, interaction, projection],
+    [activeStackPlayback, interaction, isReplay, projection],
   );
   const initialScene = useRef(scene);
   const initialSelectionKey = JSON.stringify(
@@ -730,7 +733,7 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
         pass: passRef,
         player: playerRef,
         stack: stackRef,
-      });
+      }, mode);
       vue.current = mounted.vue;
       sceneRef.current = mounted.currentScene;
     } catch (reason) {
@@ -741,7 +744,7 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
       vue.current = null;
       sceneRef.current = null;
     };
-  }, []);
+  }, [mode]);
   useEffect(() => {
     if (sceneRef.current) sceneRef.current.value = scene;
   }, [scene]);
@@ -781,8 +784,8 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
   const sourceXChoice = castingXNumberChoice(sourceChoices);
 
   return <>
-    <div className="local-pixi-vue-host" ref={host} />
-    <div className="pixi-matchup-badge">{matchup}</div>
+    <div className={`local-pixi-vue-host${isReplay ? " replay-pixi-vue-host" : ""}`} ref={host} />
+    {!isReplay && <div className="pixi-matchup-badge">{matchup}</div>}
     {(projection.gameNotes?.length ?? 0) > 0 && <aside className={`pixi-game-notes${notesOpen ? " open" : ""}`}>
       <button type="button" aria-expanded={notesOpen} onClick={() => setNotesOpen((open) => {
         if (open) setNotePreview(null);
@@ -840,7 +843,7 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
       <img src={hoveredCard.imageUrl} alt="" />
     </div>}
     {visualError && <div className="pixi-visual-error" role="alert">Pixi: {visualError}</div>}
-    {dungeonChoice && <div className="pixi-dungeon-choice" role="dialog" aria-label={dungeonChoice.prompt}>
+    {!isReplay && <>{dungeonChoice && <div className="pixi-dungeon-choice" role="dialog" aria-label={dungeonChoice.prompt}>
       <header>
         <strong>{dungeonChoice.prompt}</strong>
         {dungeonChoice.currentRoom && <span>Current room: {dungeonChoice.currentRoom}</span>}
@@ -980,6 +983,6 @@ export default function LocalPixiRenderer({ deckSelections, matchup, view, onAct
       <strong>{projection.numberChoice.prompt}</strong>
       <input type="number" min={projection.numberChoice.minimum} max={projection.numberChoice.maximum} value={numberValue} onChange={(event) => setNumberValue(Number(event.target.value))} />
       <button type="button" onClick={() => submit(projection.actions[0].id, { numberValue })}>Confirm</button>
-    </div>}
+    </div>}</>}
   </>;
 }

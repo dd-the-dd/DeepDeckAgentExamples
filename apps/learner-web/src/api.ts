@@ -68,7 +68,7 @@ export type LocalDeck = { deckSessionId: string; deckName: string };
 export type LocalModel = {
   id: string;
   name: string;
-  architecture: "v11" | "v12";
+  architecture: string;
   format: "legacy" | "commander";
   description: string;
   createdAt: string;
@@ -125,9 +125,11 @@ export type ActiveGame = {
 export type TrainingStatistic = {
   modelId: string;
   modelName: string;
-  architecture: 'v11' | 'v12';
+  architecture: 'v11' | 'v12' | 'v13';
   format: string;
   completedGames: number;
+  totalRLEpisodes?: number;
+  engineCompletedGames?: number;
   trainingStep: number;
   parallelGames: number;
   activeGames: number;
@@ -137,6 +139,29 @@ export type TrainingStatistic = {
   simulationSeconds: number;
   modelTrainingSeconds: number;
   averageGameSeconds: number | null;
+  metricWindow: '50' | '200' | '1000' | '5000' | 'all';
+  metricRecordCount: number;
+  metricPointsReturned: number;
+  windowSummary: {
+    sampleType: 'games' | 'rl-episodes' | 'synthetic-batches';
+    gameMetricsAvailable: boolean;
+    engineGameMetrics: boolean;
+    attemptedSamples?: number;
+    generatedSamples: number;
+    usedSamples: number;
+    failedSamples: number;
+    utilizationRate: number | null;
+    coveredTrainingSteps: number;
+    generatedDecisions: number;
+    usedDecisions: number;
+    averageGameSeconds: number | null;
+    p50GameSeconds: number | null;
+    p95GameSeconds: number | null;
+    simulationSeconds: number | null;
+    trainingSeconds: number | null;
+    collectionWallSeconds: number | null;
+    gamesPerHour: number | null;
+  };
   latestMetrics: Array<{
     episode: number;
     trainingStep: number;
@@ -144,6 +169,11 @@ export type TrainingStatistic = {
     policyLoss: number | null;
     valueLoss: number | null;
     entropy: number | null;
+    episodeReward: number | null;
+    approxKl: number | null;
+    clipFraction: number | null;
+    dataSource: string | null;
+    losses?: Record<string, number>;
     gameDurationSeconds: number | null;
   }>;
   updatedAtUnixMs: number | null;
@@ -190,11 +220,11 @@ export type ResourceSnapshot = {
 export type DeckStatistic = {
   modelId: string;
   modelName: string;
-  architecture: "v11" | "v12";
+  architecture: "v11" | "v12" | "v13";
   deckVersionId: string;
   deckName: string;
   format: string;
-  ratingSystem: "plackett-luce";
+  ratingSystem: "plackett-luce" | "engine-self-play";
   mu: number;
   sigma: number;
   ordinal: number;
@@ -202,7 +232,224 @@ export type DeckStatistic = {
   matches: number;
   gameWins: number;
   gameLosses: number;
+  draws?: number;
   winRate: number | null;
+};
+
+export type TrainingSettings = {
+  schemaVersion: 'training-platform/v1';
+  modelId: string;
+  architecture: string;
+  savedGameLimit: number;
+  checkpointEvery: number;
+  evaluationEvery: number;
+  evaluationGamesPerScenario: number;
+  stages: {
+    worldModel: boolean;
+    reinforcementLearning: boolean;
+    engineEvaluation: boolean;
+  };
+  targets: {
+    worldModelSteps: number;
+    reinforcementLearningEpisodes: number;
+  };
+  curriculum: {
+    enabled: boolean;
+    adaptive: boolean;
+    scenarioIds: string[];
+  };
+  engineEvaluationSupported: boolean;
+  requiresRestart: boolean;
+};
+
+export type CurriculumScenario = {
+  id: string;
+  family: string;
+  revision: number;
+  label: string;
+  description: string;
+  difficulty: number;
+  objective: string;
+  target_round: number | null;
+  opening_hand_pool_size: number | null;
+  opening_hand_candidate_cards: string[];
+  opening_hand_roles: string[][];
+  free_casts: boolean;
+  miracle_pressure: number;
+  legacy_match: boolean;
+  deck_hint: string | null;
+  opponent_deck_hint: string | null;
+  fixed_hand: string[];
+  success_cards: string[];
+  success_zones: string[];
+  success_action_sequence: string[];
+  sideboard_target_cards: string[];
+  sideboard_cut_cards: string[];
+  tags: string[];
+};
+
+export type TrainingCurriculum = {
+  schemaVersion: 'deepdeck-training-curriculum/v1';
+  scenarios: CurriculumScenario[];
+};
+
+export type TrainingEvidence = {
+  modelId: string;
+  status: 'not-connected' | 'not-evaluated' | 'insufficient' | 'measured' | 'verified';
+  verdict: string;
+  engineEvaluationSupported: boolean;
+  magicEvidence: boolean;
+  fixedSeeds: boolean;
+  evaluationPeriods: number;
+  games: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  winRate: number | null;
+  lower95: number | null;
+  upper95: number | null;
+  promotions: number;
+  trend: Array<{
+    period: number;
+    trainingStep: number;
+    opponent: string | null;
+    games: number;
+    winRate: number | null;
+    lower95: number | null;
+    upper95: number | null;
+    promoted: boolean;
+  }>;
+  byDeck: Array<{
+    deck: string;
+    games: number;
+    wins: number;
+    losses: number;
+    draws: number;
+    winRate: number | null;
+    lower95: number | null;
+    upper95: number | null;
+  }>;
+  curriculum: {
+    games: number;
+    evaluationPeriods: number;
+    evaluationByScenario: Array<{
+      scenarioId: string;
+      games: number;
+      successes: number;
+      successRate: number;
+      meanMastery: number;
+    }>;
+    latestEvaluation: {
+      expectedScenarios: number;
+      completedScenarios: number;
+      successes: number;
+      successRate: number;
+      meanMastery: number;
+      failedScenarios: number;
+      recoveredScenarios?: number;
+      engineErrors?: number;
+    } | null;
+    byScenario: Array<{
+      scenarioId: string;
+      family: string;
+      scenarioVersion: number;
+      objective: string;
+      difficulty: number | null;
+      games: number;
+      successes: number;
+      successRate: number | null;
+      averageRound: number | null;
+      averageDecisions: number | null;
+      averageMilestoneProgress: number | null;
+      averageDamageProgress: number | null;
+      averageSideboardCards: number | null;
+      sideboardTargetCoverage: number | null;
+      sideboardCutCoverage: number | null;
+      recent: boolean[];
+      adaptiveWeight: number | null;
+    }>;
+  };
+};
+
+export type SavedReplaySummary = {
+  id: string;
+  createdAtUnixMs: number | null;
+  episode: number | null;
+  seed: number | null;
+  matchupId: string | null;
+  decks: string[];
+  gameMode: string | null;
+  gameStatus: string | null;
+  roundNumber: number | null;
+  winner: string | null;
+  durationSeconds: number | null;
+  frameCount: number;
+  bytes: number;
+  saved: boolean;
+  viewing: boolean;
+};
+
+export type SavedReplay = {
+  schemaVersion: 'deepdeck-replay/v1';
+  id: string;
+  createdAtUnixMs: number;
+  metadata: Record<string, unknown>;
+  frames: Array<Record<string, unknown>>;
+};
+
+export type AgentTrainingParameter = {
+  key: string;
+  label: string;
+  kind: 'integer' | 'number' | 'boolean' | 'string' | 'choice';
+  default: string | number | boolean | null;
+  description: string;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  choices: Array<string | number | boolean | null>;
+  apply: 'live' | 'next-phase' | 'next-run';
+};
+
+export type AgentTrainingContract = {
+  schemaVersion: 'deepdeck-agent-training/v1';
+  agentId: string;
+  displayName: string;
+  ownsCurriculum: boolean;
+  ownsPromotionCriteria: boolean;
+  proposesExperiments: boolean;
+  replaySupport: 'none' | 'summary' | 'full';
+  phases: Array<{
+    id: string;
+    label: string;
+    description: string;
+    controls: Array<'start' | 'pause' | 'resume' | 'stop' | 'evaluate' | 'checkpoint'>;
+    metrics: Array<{
+      key: string;
+      label: string;
+      kind: 'loss' | 'reward' | 'rate' | 'count' | 'duration' | 'scalar';
+      direction: 'minimize' | 'maximize' | 'target' | 'neutral';
+      unit: string;
+      description: string;
+      group: string;
+    }>;
+    parameters: AgentTrainingParameter[];
+  }>;
+};
+
+export type AgentTrainingPublication = {
+  contract: AgentTrainingContract;
+  state: Record<string, unknown> | null;
+  control: Record<string, unknown> | null;
+  parameterValues: Record<string, string | number | boolean | null>;
+  metrics: Array<{
+    schemaVersion: string;
+    agentId: string;
+    phase: string;
+    step: number;
+    metrics: Record<string, number>;
+    recordedAtUnixMs: number | null;
+    context?: Record<string, unknown>;
+  }>;
 };
 
 type Page<T> = {
@@ -312,8 +559,130 @@ export async function loadDeckStatistics(): Promise<DeckStatistic[]> {
   return (await json<Page<DeckStatistic>>(await fetch('/api/v1/statistics/decks'))).items;
 }
 
-export async function loadTrainingStatistics(): Promise<TrainingStatistic[]> {
-  return (await json<Page<TrainingStatistic>>(await fetch('/api/v1/statistics/training'))).items;
+export async function loadTrainingStatistics(window: TrainingStatistic['metricWindow'] = '200'): Promise<TrainingStatistic[]> {
+  const query = new URLSearchParams({ window });
+  return (await json<Page<TrainingStatistic>>(await fetch(`/api/v1/statistics/training?${query}`))).items;
+}
+
+export async function loadTrainingSettings(modelId: string): Promise<TrainingSettings> {
+  return json<TrainingSettings>(
+    await fetch(`/api/v1/models/${encodeURIComponent(modelId)}/training-settings`),
+  );
+}
+
+export async function loadTrainingCurriculum(): Promise<TrainingCurriculum> {
+  return json<TrainingCurriculum>(await fetch('/api/v1/training/curriculum'));
+}
+
+export async function saveTrainingSettings(
+  modelId: string,
+  settings: TrainingSettings,
+): Promise<TrainingSettings> {
+  return json<TrainingSettings>(
+    await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/training-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    }),
+  );
+}
+
+export async function loadTrainingEvidence(modelId: string): Promise<TrainingEvidence> {
+  return json<TrainingEvidence>(
+    await fetch(`/api/v1/models/${encodeURIComponent(modelId)}/evidence`),
+  );
+}
+
+export async function loadAgentTrainingContract(modelId: string): Promise<AgentTrainingPublication | null> {
+  const response = await fetch(`/api/v1/models/${encodeURIComponent(modelId)}/training-contract`);
+  if (response.status === 404) return null;
+  if (!response.headers.get('Content-Type')?.includes('application/json')) return null;
+  const publication = await json<AgentTrainingPublication | unknown>(response);
+  if (!publication || typeof publication !== 'object' || !('contract' in publication)) return null;
+  return publication as AgentTrainingPublication;
+}
+
+export async function saveAgentTrainingControl(
+  modelId: string,
+  payload: { phase: string; action: string; parameters: Record<string, unknown> },
+): Promise<Record<string, unknown>> {
+  return json(
+    await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/training-control`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function loadSavedReplays(modelId: string): Promise<SavedReplaySummary[]> {
+  return (
+    await json<Page<SavedReplaySummary>>(
+      await fetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays`),
+    )
+  ).items;
+}
+
+export async function loadSavedReplay(
+  modelId: string,
+  replayId: string,
+): Promise<SavedReplay> {
+  return json<SavedReplay>(
+    await fetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays/${encodeURIComponent(replayId)}`),
+  );
+}
+
+export async function acquireSavedReplay(
+  modelId: string,
+  replayId: string,
+): Promise<{ replay: SavedReplay; leaseId: string; expiresAtUnixMs: number; saved: boolean }> {
+  const response = await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays/${encodeURIComponent(replayId)}/leases`, {
+    method: 'POST',
+  });
+  if (response.status === 404 || !response.headers.get('Content-Type')?.includes('application/json')) {
+    return {
+      replay: await loadSavedReplay(modelId, replayId),
+      leaseId: '',
+      expiresAtUnixMs: 0,
+      saved: false,
+    };
+  }
+  return json(response);
+}
+
+export async function renewSavedReplayLease(
+  modelId: string,
+  replayId: string,
+  leaseId: string,
+): Promise<{ expiresAtUnixMs: number }> {
+  return json(
+    await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays/${encodeURIComponent(replayId)}/leases/${encodeURIComponent(leaseId)}`, {
+      method: 'PUT',
+    }),
+  );
+}
+
+export async function releaseSavedReplayLease(
+  modelId: string,
+  replayId: string,
+  leaseId: string,
+): Promise<{ released: boolean }> {
+  return json(
+    await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays/${encodeURIComponent(replayId)}/leases/${encodeURIComponent(leaseId)}`, {
+      method: 'DELETE',
+    }),
+  );
+}
+
+export async function saveReplayForever(
+  modelId: string,
+  replayId: string,
+): Promise<{ saved: boolean }> {
+  return json(
+    await authorizedFetch(`/api/v1/models/${encodeURIComponent(modelId)}/replays/${encodeURIComponent(replayId)}/save`, {
+      method: 'POST',
+    }),
+  );
 }
 
 export async function loadActiveGames(): Promise<ActiveGame[]> {

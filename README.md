@@ -130,6 +130,10 @@ React.
 - `random`: reproducible random selection from exact legal actions.
 - `alexios`: a readable priority policy for Alexios, equipment, protection,
   removal, goad, combat tricks, Food, and Clues.
+- `forge-cautious`, `forge-balanced`, `forge-aggressive`: clean-room,
+  programmatic Forge-style references that rank the Engine's exact legal
+  actions without copying or linking Forge's GPL-3.0 implementation. See the
+  [Forge reference-agent notes](docs/forge-reference-agents.md).
 - `v11`: recurrent PyTorch policy with multiplayer value estimates.
 - `v12`: two-player variant with antisymmetric value estimates.
 
@@ -139,6 +143,7 @@ The original command-line interfaces remain available:
 deepdeck-train v12 --smoke --epochs 2 --output runs/v12-smoke
 deepdeck-example v12 --target local --checkpoint runs/v12-smoke
 deepdeck-example alexios --target ddl --speed 1s
+deepdeck-example forge-balanced --target local --start-local-game
 ```
 
 The complete Oracle AI implementation is also installed with the workbench:

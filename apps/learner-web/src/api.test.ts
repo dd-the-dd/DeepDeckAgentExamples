@@ -31,4 +31,18 @@ describe('local session authorization', () => {
       'current-token',
     );
   });
+
+  it('requests the selected training metric window', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ items: [] })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { loadTrainingStatistics } = await import('./api');
+
+    await loadTrainingStatistics('all');
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      '/api/v1/statistics/training?window=all',
+    );
+  });
 });

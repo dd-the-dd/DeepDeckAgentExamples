@@ -1390,6 +1390,7 @@ class LeagueTrainer:
         self.config = config
         self.output = Path(config.get("outputDir", "runs/oracle-ai-league"))
         self.output.mkdir(parents=True, exist_ok=True)
+        self.saved_game_limit = max(0, min(500, int(config.get("savedGameLimit", 20))))
         self.model_evaluation_enabled = bool(config.get("modelEvaluationEnabled", True))
         self.ground_truth_evaluation_enabled = bool(
             config.get("groundTruthEvaluationEnabled", True)
@@ -2122,7 +2123,7 @@ class LeagueTrainer:
         return evaluation
 
     def _new_training_environment(self) -> RustSelfPlayEnvironment:
-        return RustSelfPlayEnvironment(
+        environment = RustSelfPlayEnvironment(
             self.config.get("engineUrl", "http://127.0.0.1:8787"),
             self.training_matchups,
             float(self.config.get("engineTimeoutSeconds", 120)),
@@ -2133,6 +2134,65 @@ class LeagueTrainer:
             float(self.config.get("legacyMatchWinReward", 1.0)),
             bool(self.config.get("scaleRewardsByPlackettLuce", False)),
         )
+        environment.capture_replay = self.saved_game_limit > 0
+        return environment
+
+    def _save_training_replay(
+        self,
+        environment: Any,
+        training_record: dict[str, Any],
+    ) -> None:
+        if self.saved_game_limit <= 0:
+            return
+        frames = getattr(environment, "replay_frames", None)
+        if not isinstance(frames, list) or not frames:
+            return
+        replay_dir = self.output / "replays"
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        replay_id = f"episode-{int(training_record['episode']):08d}"
+        target = replay_dir / f"{replay_id}.json"
+        saved_target = self.output / "saved-replays" / f"{replay_id}.json"
+        if target.exists() or saved_target.exists():
+            replay_id = (
+                f"{replay_id}-{int(training_record.get('completedAtUnixMs') or time.time() * 1000)}"
+            )
+        payload = {
+            "schemaVersion": "deepdeck-replay/v1",
+            "id": replay_id,
+            "createdAtUnixMs": training_record.get("completedAtUnixMs"),
+            "metadata": training_record,
+            "frames": frames,
+        }
+        target = replay_dir / f"{replay_id}.json"
+        pending = replay_dir / f"{replay_id}.json.pending"
+        pending.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        pending.replace(target)
+        replay_files = sorted(
+            replay_dir.glob("episode-*.json"),
+            key=lambda path: path.name,
+        )
+        excess = max(0, len(replay_files) - self.saved_game_limit)
+        for expired in replay_files:
+            if excess <= 0:
+                break
+            lease_dir = replay_dir / ".leases" / expired.stem
+            protected = False
+            for lease in lease_dir.glob("*.lease") if lease_dir.is_dir() else ():
+                try:
+                    protected = int(lease.read_text(encoding="utf-8").strip()) > int(
+                        time.time()
+                    )
+                except (OSError, ValueError):
+                    continue
+                if protected:
+                    break
+            if protected:
+                continue
+            expired.unlink(missing_ok=True)
+            excess -= 1
 
     def _apply_gpu_memory_limit(self, limit_mb: int) -> None:
         if self.device.type != "cuda":
@@ -3069,6 +3129,7 @@ class LeagueTrainer:
                     ),
                 }
                 _append_jsonl(self.output / "training.jsonl", training_record)
+                self._save_training_replay(collection.job.environment, training_record)
                 # The full record already lives in training.jsonl. Emitting it
                 # again made learner-process.log grow by several kilobytes per
                 # game, so stdout carries only the live progress summary.

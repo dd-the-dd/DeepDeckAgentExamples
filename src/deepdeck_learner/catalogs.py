@@ -75,6 +75,72 @@ def platform_decks(search: str, game_format: str, page: int = 1) -> dict[str, An
     return data
 
 
+def cached_decks(root: Path, search: str, game_format: str, page: int = 1) -> dict[str, Any]:
+    """List downloaded deck snapshots when the hosted catalog is unavailable."""
+    if game_format not in {"legacy", "commander"}:
+        raise CatalogError("Format must be legacy or commander.")
+    normalized = search.strip().casefold()
+    items: list[dict[str, Any]] = []
+    for path in (root / ".deepdeck" / "decks").glob("*.json"):
+        try:
+            deck = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(deck, dict) or str(deck.get("format", "")).casefold() != game_format:
+            continue
+        name = str(deck.get("name", "Local deck"))
+        if normalized and normalized not in name.casefold():
+            continue
+        cards = deck.get("cards", [])
+        items.append(
+            {
+                "id": str(deck.get("id") or path.stem),
+                "deckId": deck.get("deckId"),
+                "name": name,
+                "creator": deck.get("creator"),
+                "version": int(deck.get("version", 1) or 1),
+                "format": game_format,
+                "colors": deck.get("colors", []),
+                "playableCardCount": _playable_card_count(cards) if isinstance(cards, list) else 0,
+                "cached": True,
+            }
+        )
+    items.sort(key=lambda item: (str(item["name"]).casefold(), -int(item["version"])))
+    page_size = 12
+    current_page = max(1, int(page))
+    start = (current_page - 1) * page_size
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    return {
+        "items": items[start : start + page_size],
+        "pagination": {
+            "page": current_page,
+            "totalPages": total_pages,
+            "hasNextPage": current_page < total_pages,
+        },
+        "source": "local-cache",
+    }
+
+
+def cached_deck_download(root: Path, version_id: str) -> dict[str, Any] | None:
+    target = root / ".deepdeck" / "decks" / f"{version_id.strip()}.json"
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    cards = data.get("cards", []) if isinstance(data, dict) else []
+    if not isinstance(cards, list):
+        return None
+    return {
+        "versionId": version_id,
+        "name": str(data.get("name", "Training deck")),
+        "format": data.get("format"),
+        "cardCount": _playable_card_count(cards),
+        "rawCardCount": data.get("cardCount", len(cards)),
+        "path": str(target),
+        "cached": True,
+    }
+
+
 def _playable_card_count(cards: list[Any]) -> int:
     total = 0
     for card in cards:

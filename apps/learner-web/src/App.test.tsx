@@ -9,7 +9,7 @@ import {
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import App from "./App";
-import type { CapabilityStatus, Job } from "./api";
+import type { CapabilityStatus, Job, LocalModel } from "./api";
 
 const status: CapabilityStatus = {
   controller: { ready: true, version: "test" },
@@ -86,6 +86,25 @@ const resources = {
     ramPerGameEstimate: 0,
     attribution: "Shared Engine RSS divided by active local games.",
   },
+};
+
+const selfPlayModel: LocalModel = {
+  id: "self-play-agent",
+  name: "Self-play Agent",
+  architecture: "v13",
+  format: "legacy",
+  description: "Graph agent",
+  createdAt: "2026-09-01T00:00:00Z",
+  runPath: "self-play-run",
+  checkpointPath: "self-play-checkpoint",
+  status: "stopped",
+  ready: true,
+  reservePlaytest: true,
+  selfPlayAllSeats: true,
+  decks: [],
+  diskBytes: 1024,
+  weightsBytes: 512,
+  trainingState: { completedGames: 0, trainingStep: 0, parallelGames: 0, activeGames: 0 },
 };
 
 function readResponse(url: string, currentStatus: CapabilityStatus = status) {
@@ -183,6 +202,58 @@ describe("guided onboarding", () => {
     expect(await screen.findByText("1 running")).toBeInTheDocument();
     expect(screen.queryByText("Opening Pixi…")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Local playable table")).not.toBeInTheDocument();
+  });
+
+  test("stops and refreshes a playtest job with visible async feedback", async () => {
+    const playtest: Job = {
+      id: "playtest-job",
+      kind: "playtest.agent",
+      label: "Local AI playtest",
+      argv: [],
+      status: "running",
+      created_at: "2026-09-01T00:00:00Z",
+      started_at: "2026-09-01T00:00:01Z",
+      finished_at: null,
+      exit_code: null,
+      artifact_path: null,
+      logs: ["Game ready."],
+      model_id: "local-model",
+      worker_slots: 1,
+    };
+    let running = true;
+    let finishStop: (value: Response) => void = () => undefined;
+    const pendingStop = new Promise<Response>((resolve) => { finishStop = resolve; });
+    let jobReads = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/jobs/playtest-job/stop") && init?.method === "POST") {
+        return pendingStop;
+      }
+      if (url.endsWith("/api/v1/jobs")) {
+        jobReads += 1;
+        return response(running ? [playtest] : [{ ...playtest, status: "stopped" }]);
+      }
+      if (url.endsWith("/api/v1/session")) return response({ token: "local-token" });
+      return readResponse(url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Play against your AI/ }));
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    fireEvent.click(stop);
+    expect(await screen.findByRole("button", { name: "Stoppingâ€¦" })).toHaveAttribute("aria-busy", "true");
+
+    running = false;
+    finishStop(new Response(JSON.stringify({ ...playtest, status: "stopped" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument());
+
+    const readsBeforeRefresh = jobReads;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(jobReads).toBeGreaterThan(readsBeforeRefresh));
   });
 
   test("one local setup button requests the composite controller job", async () => {
@@ -628,5 +699,92 @@ describe("guided onboarding", () => {
       "/api/v1/jobs/league-worker/stop",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  test("shows self-play startup progress immediately", async () => {
+    let finishStart: (value: Response) => void = () => undefined;
+    const pendingStart = new Promise<Response>((resolve) => { finishStart = resolve; });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/models") && !init?.method) return response({ items: [selfPlayModel] });
+      if (url.endsWith("/api/v1/models/self-play-agent/resources")) return response({ trainingMatches: 1, localMatches: 1, leagueMatches: 0, gpuMemoryMb: 0 });
+      if (url.endsWith("/api/v1/jobs") && init?.method === "POST") return pendingStart;
+      if (url.endsWith("/api/v1/jobs")) return response([]);
+      if (url.endsWith("/api/v1/session")) return response({ token: "local-token" });
+      return readResponse(url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Jobs/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start training" }));
+
+    expect(await screen.findByText(/Starting self-play/i)).toBeInTheDocument();
+    finishStart(new Response(JSON.stringify({ id: "training-job", status: "queued" }), { status: 202, headers: { "Content-Type": "application/json" } }));
+    expect(await screen.findByText(/Self-play request accepted/i)).toBeInTheDocument();
+  });
+
+  test("surfaces the latest self-play worker error", async () => {
+    const failedJob: Job = {
+      id: "failed-training",
+      kind: "training.pool",
+      label: "Self-play Agent Â· V13",
+      argv: [],
+      status: "failed",
+      created_at: "2026-09-01T00:00:00Z",
+      started_at: "2026-09-01T00:00:01Z",
+      finished_at: "2026-09-01T00:00:02Z",
+      exit_code: 1,
+      artifact_path: "self-play-run",
+      logs: ["CUDA ran out of memory while starting the worker."],
+      model_id: selfPlayModel.id,
+    };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/models") && !init?.method) return response({ items: [selfPlayModel] });
+      if (url.endsWith("/api/v1/models/self-play-agent/resources")) return response({ trainingMatches: 1, localMatches: 1, leagueMatches: 0, gpuMemoryMb: 0 });
+      if (url.endsWith("/api/v1/jobs")) return response([failedJob]);
+      return readResponse(url);
+    }));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Jobs/ }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Self-play failed.*CUDA ran out of memory/i);
+  });
+});
+
+describe("deck rating table", () => {
+  test("sorts by Elo-like rating by default and lets every column change the order", async () => {
+    const deckRatings = [
+      { modelId: "agent", modelName: "Agent", architecture: "v12", deckVersionId: "alpha", deckName: "Alpha", format: "legacy", ratingSystem: "plackett-luce", mu: 30, sigma: 3, ordinal: 20, rank: 2, matches: 12, gameWins: 7, gameLosses: 5, winRate: 7 / 12 },
+      { modelId: "agent", modelName: "Agent", architecture: "v12", deckVersionId: "beta", deckName: "Beta", format: "legacy", ratingSystem: "plackett-luce", mu: 22, sigma: 4, ordinal: 10, rank: 3, matches: 8, gameWins: 3, gameLosses: 5, winRate: 3 / 8 },
+      { modelId: "agent", modelName: "Agent", architecture: "v12", deckVersionId: "gamma", deckName: "Gamma", format: "legacy", ratingSystem: "plackett-luce", mu: 36, sigma: 1, ordinal: 33, rank: 1, matches: 3, gameWins: 3, gameLosses: 0, winRate: 1 },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/statistics/decks")) return response({ items: deckRatings });
+        if (url.includes("/api/v1/statistics/training?")) return response({ items: [] });
+        return readResponse(url);
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Training statistics/ }));
+
+    const table = await screen.findByRole("table");
+    const rowNames = () => within(table).getAllByRole("row").slice(1).map((row) => within(row).getAllByRole("strong")[0].textContent);
+    expect(screen.getByRole("columnheader", { name: /Elo-like rating/i })).toHaveAttribute("aria-sort", "descending");
+    expect(rowNames()).toEqual(["Gamma", "Alpha", "Beta"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Matches" }));
+    expect(rowNames()).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(screen.getByRole("columnheader", { name: /Matches/i })).toHaveAttribute("aria-sort", "descending");
+
+    fireEvent.click(screen.getByRole("button", { name: "Matches" }));
+    expect(rowNames()).toEqual(["Gamma", "Beta", "Alpha"]);
+    expect(screen.getByRole("columnheader", { name: /Matches/i })).toHaveAttribute("aria-sort", "ascending");
   });
 });

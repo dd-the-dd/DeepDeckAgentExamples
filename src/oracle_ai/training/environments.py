@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 from collections.abc import Callable
 from copy import deepcopy
@@ -34,6 +35,20 @@ class Matchup:
     training_anchor_player_ids: tuple[str, ...] = ()
     anchor_deadline_round: int | None = None
     anchor_opening_hand_pool_size: int | None = None
+    scenario_id: str | None = None
+    scenario_family: str | None = None
+    scenario_version: int = 1
+    objective: str | None = None
+    difficulty: int | None = None
+    target_round: int | None = None
+    fixed_opening_hand_definition_ids: tuple[str, ...] = ()
+    opening_hand_target_roles: tuple[tuple[str, ...], ...] = ()
+    success_card_names: tuple[str, ...] = ()
+    success_zones: tuple[str, ...] = ("battlefield",)
+    success_action_sequence: tuple[str, ...] = ()
+    start_with_sideboarding: bool = False
+    sideboard_target_card_names: tuple[str, ...] = ()
+    sideboard_cut_card_names: tuple[str, ...] = ()
 
 
 class RustSessionEnvironment:
@@ -43,6 +58,8 @@ class RustSessionEnvironment:
     non-learner players. The learner receives only the session projection and
     legal options published for its current decision.
     """
+
+    replay_zones = ("library", "hand", "battlefield", "graveyard", "exile", "commandZone")
 
     def __init__(
         self,
@@ -68,6 +85,320 @@ class RustSessionEnvironment:
         self.analytics_context_id = f"training:{learner_pilot_id}"
         self.analytics_pilot_override: dict[str, str] | None = None
         self.progress_callback: Callable[[dict[str, Any]], None] | None = None
+        self.capture_replay = False
+        self.replay_frames: list[dict[str, Any]] = []
+        self.objective_completed = False
+        self.objective_action_labels: list[str] = []
+        self.objective_milestones_completed = 0
+        self.opening_hand_selected_card_names: list[str] = []
+        self.opening_hand_roles_available = 0
+        self.objective_damage_progress = 0.0
+        self.sideboard_cards_selected = 0
+        self.sideboard_target_cards_selected = 0
+        self.sideboard_target_cards_available = 0
+        self.sideboard_cut_cards_selected = 0
+        self.sideboard_cut_cards_expected = 0
+
+    def _objective_sequence_progress(self) -> int:
+        matchup = self.current_matchup
+        if matchup is None or not matchup.success_action_sequence:
+            return 0
+        progress = 0
+        for label in self.objective_action_labels:
+            if matchup.success_action_sequence[progress].casefold() in label.casefold():
+                progress += 1
+                if progress == len(matchup.success_action_sequence):
+                    break
+        return progress
+
+    @staticmethod
+    def _opening_hand_card_name(action: dict[str, Any]) -> str:
+        candidate = (action.get("decisions") or {}).get("openingHandCandidate")
+        if not isinstance(candidate, dict):
+            return ""
+        definition = candidate.get("definition")
+        return str(definition.get("name", "")) if isinstance(definition, dict) else ""
+
+    def _initialize_opening_hand_roles(self, step: DecisionStep) -> None:
+        matchup = self.current_matchup
+        if matchup is None or not matchup.opening_hand_target_roles:
+            self.opening_hand_roles_available = 0
+            return
+        candidate_names = {
+            self._opening_hand_card_name(action) for action in step.actions
+        }
+        self.opening_hand_roles_available = sum(
+            bool(candidate_names.intersection(role))
+            for role in matchup.opening_hand_target_roles
+        )
+
+    def _opening_hand_role_progress(self) -> int:
+        matchup = self.current_matchup
+        if matchup is None or not matchup.opening_hand_target_roles:
+            return 0
+        selected = set(self.opening_hand_selected_card_names)
+        return sum(bool(selected.intersection(role)) for role in matchup.opening_hand_target_roles)
+
+    def _damage_progress(self, view: dict[str, Any]) -> float:
+        matchup = self.current_matchup
+        if (
+            matchup is None
+            or matchup.objective not in {"fast-win", "combo-win"}
+            or not matchup.training_anchor_player_ids
+        ):
+            return 0.0
+        opponent = next(
+            (
+                player
+                for player in (view.get("state", {}) or {}).get("players", [])
+                if isinstance(player, dict)
+                and str(player.get("id", "")) == matchup.opponent_player_id
+            ),
+            None,
+        )
+        if opponent is None:
+            return 0.0
+        starting_life = next(
+            (
+                float(player.get("startingLife", 20) or 20)
+                for player in matchup.setup.get("players", [])
+                if str(player.get("id", "")) == matchup.opponent_player_id
+            ),
+            20.0,
+        )
+        if starting_life <= 0:
+            return 0.0
+        current_life = float(opponent.get("life", starting_life) or 0)
+        return max(0.0, min(1.0, (starting_life - current_life) / starting_life))
+
+    @staticmethod
+    def _sideboard_cards_brought_in(selected_action: dict[str, Any]) -> int:
+        decisions = selected_action.get("decisions") or {}
+        final_main_deck_ids = {
+            str(card_id)
+            for key, values in decisions.items()
+            if "configure:cards" in str(key)
+            for card_id in (values if isinstance(values, list) else [])
+        }
+        initial_main_deck_ids = {
+            str(card_id)
+            for card_id in (
+                decisions.get("initialMainDeckIds", [])
+                if isinstance(decisions.get("initialMainDeckIds"), list)
+                else []
+            )
+        }
+        return len(final_main_deck_ids - initial_main_deck_ids)
+
+    def _policy_actions(self, decision: dict[str, Any]) -> list[dict[str, Any]]:
+        card_names = {
+            str(card.get("id")): str(card.get("name", card.get("id", "")))
+            for player in (
+                self.current_matchup.setup.get("players", [])
+                if self.current_matchup
+                else []
+            )
+            for card in player.get("cards", [])
+            if isinstance(card, dict) and card.get("id")
+        }
+        return expand_policy_actions(
+            decision,
+            card_names,
+            self.current_matchup.sideboard_target_card_names
+            if self.current_matchup
+            else (),
+            self.current_matchup.sideboard_cut_card_names
+            if self.current_matchup
+            else (),
+        )
+
+    def _sideboard_target_cards_brought_in(
+        self,
+        selected_action: dict[str, Any],
+    ) -> int:
+        matchup = self.current_matchup
+        if matchup is None or not matchup.sideboard_target_card_names:
+            return 0
+        decisions = selected_action.get("decisions") or {}
+        initial = {
+            str(value) for value in decisions.get("initialMainDeckIds", [])
+        }
+        final = {
+            str(card_id)
+            for key, values in decisions.items()
+            if "configure:cards" in str(key)
+            for card_id in (values if isinstance(values, list) else [])
+        }
+        definitions = {
+            str(card.get("id")): str(card.get("name", ""))
+            for player in matchup.setup.get("players", [])
+            if str(player.get("id", "")) == matchup.learner_player_id
+            for card in player.get("cards", [])
+            if isinstance(card, dict) and card.get("id")
+        }
+        targets = set(matchup.sideboard_target_card_names)
+        selected = 0
+        for instance_id in final - initial:
+            parts = instance_id.split(":")
+            definition_id = ":".join(parts[1:-1]) if len(parts) >= 3 else instance_id
+            selected += int(definitions.get(definition_id) in targets)
+        return selected
+
+    def _sideboard_cut_cards_taken_out(self, selected_action: dict[str, Any]) -> int:
+        matchup = self.current_matchup
+        if matchup is None or not matchup.sideboard_cut_card_names:
+            return 0
+        decisions = selected_action.get("decisions") or {}
+        initial = {str(value) for value in decisions.get("initialMainDeckIds", [])}
+        final = {
+            str(card_id)
+            for key, values in decisions.items()
+            if "configure:cards" in str(key)
+            for card_id in (values if isinstance(values, list) else [])
+        }
+        definitions = {
+            str(card.get("id")): str(card.get("name", ""))
+            for player in matchup.setup.get("players", [])
+            if str(player.get("id", "")) == matchup.learner_player_id
+            for card in player.get("cards", [])
+            if isinstance(card, dict) and card.get("id")
+        }
+        targets = set(matchup.sideboard_cut_card_names)
+        selected = 0
+        for instance_id in initial - final:
+            parts = instance_id.split(":")
+            definition_id = ":".join(parts[1:-1]) if len(parts) >= 3 else instance_id
+            selected += int(definitions.get(definition_id) in targets)
+        return min(selected, self.sideboard_cut_cards_expected)
+
+    @staticmethod
+    def _compact_replay_card(card: Any) -> dict[str, Any] | None:
+        if not isinstance(card, dict):
+            return None
+        definition = card.get("definition")
+        definition = definition if isinstance(definition, dict) else {}
+        return {
+            key: value
+            for key, value in {
+                "instanceId": card.get("instanceId"),
+                "name": definition.get("name", card.get("name")),
+                "cardId": definition.get("id", card.get("cardId")),
+                "controllerId": card.get("controllerId", card.get("controller")),
+                "ownerId": card.get("ownerId", card.get("owner")),
+                "tapped": card.get("tapped"),
+                "manaCost": definition.get("manaCost", card.get("manaCost")),
+                "typeLine": definition.get("typeLine", card.get("typeLine")),
+                "power": card.get("power", definition.get("power")),
+                "toughness": card.get("toughness", definition.get("toughness")),
+                "counters": card.get("counters"),
+            }.items()
+            if value not in (None, [], {})
+        }
+
+    @classmethod
+    def _compact_replay_view(cls, view: dict[str, Any]) -> dict[str, Any]:
+        state = view.get("state", {})
+        compact_state = {
+            key: deepcopy(value)
+            for key, value in state.items()
+            if key
+            in {
+                "activePlayerId",
+                "priorityPlayerId",
+                "turnNumber",
+                "step",
+                "status",
+                "outcome",
+                "winnerIds",
+            }
+        }
+        compact_players = []
+        for player in state.get("players", []):
+            if not isinstance(player, dict):
+                continue
+            compact_player = {
+                key: deepcopy(player.get(key))
+                for key in ("id", "name", "life", "poisonCounters", "hasLost")
+                if player.get(key) is not None
+            }
+            for zone in cls.replay_zones:
+                cards = player.get(zone, [])
+                if isinstance(cards, list):
+                    compact_player[zone] = [
+                        compact
+                        for card in cards
+                        if (compact := cls._compact_replay_card(card)) is not None
+                    ]
+            compact_players.append(compact_player)
+        compact_state["players"] = compact_players
+        stack = state.get("stack", [])
+        if isinstance(stack, list):
+            compact_state["stack"] = []
+            for stack_object in stack:
+                if not isinstance(stack_object, dict):
+                    continue
+                compact_card = cls._compact_replay_card(stack_object.get("card"))
+                if compact_card is None:
+                    continue
+                compact_state["stack"].append(
+                    {
+                        key: deepcopy(value)
+                        for key, value in {
+                            "id": stack_object.get("id"),
+                            "controller": stack_object.get("controller"),
+                            "abilityKind": stack_object.get("abilityKind"),
+                            "card": compact_card,
+                        }.items()
+                        if value is not None
+                    }
+                )
+        decision = view.get("decision")
+        compact_decision = None
+        if isinstance(decision, dict):
+            compact_decision = {
+                key: deepcopy(decision.get(key))
+                for key in ("id", "kind", "playerId", "choice", "sourceCardInstanceId")
+                if decision.get(key) is not None
+            }
+        return {
+            "schemaVersion": view.get("schemaVersion", "mtg-game-session/v1"),
+            "revision": view.get("revision"),
+            "state": compact_state,
+            "decision": compact_decision,
+            "matchState": deepcopy(view.get("matchState")),
+        }
+
+    @staticmethod
+    def _compact_replay_action(action: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: deepcopy(action.get(key))
+            for key in (
+                "id",
+                "kind",
+                "label",
+                "cardInstanceId",
+                "decisions",
+                "targets",
+                "_numberValue",
+                "_cardInstanceIds",
+            )
+            if action.get(key) is not None
+        }
+
+    def _start_replay(self, view: dict[str, Any]) -> None:
+        self.replay_frames = []
+        if self.capture_replay:
+            self.replay_frames.append(self._compact_replay_view(view))
+
+    def _record_replay_action(self, selected_action: dict[str, Any]) -> None:
+        if self.capture_replay and self.replay_frames:
+            self.replay_frames[-1]["selectedAction"] = self._compact_replay_action(
+                selected_action
+            )
+
+    def _record_replay_view(self, view: dict[str, Any]) -> None:
+        if self.capture_replay:
+            self.replay_frames.append(self._compact_replay_view(view))
 
     def _report_progress(self, view: dict[str, Any]) -> None:
         if self.progress_callback is not None:
@@ -221,9 +552,70 @@ class RustSessionEnvironment:
             self._remove_session()
             raise RuntimeError(f"Rust session failed: {error}")
         self._report_progress(view)
+        state = view.get("state", {})
+        matchup = self.current_matchup
+        if (
+            not self.objective_completed
+            and matchup is not None
+            and matchup.objective == "combo-trigger"
+            and matchup.success_card_names
+        ):
+            observed_cards = [
+                card
+                for player in state.get("players", [])
+                if isinstance(player, dict)
+                for zone in (
+                    "library",
+                    "hand",
+                    "battlefield",
+                    "graveyard",
+                    "exile",
+                    "commandZone",
+                )
+                for card in player.get(zone, [])
+                if isinstance(card, dict)
+            ]
+            stack_cards = [
+                item.get("card")
+                for item in state.get("stack", [])
+                if isinstance(item, dict) and isinstance(item.get("card"), dict)
+            ]
+            observed_cards.extend(stack_cards)
+            success_names = set(matchup.success_card_names)
+            success_instance_ids = {
+                str(card.get("instanceId", ""))
+                for card in observed_cards
+                if str((card.get("definition") or {}).get("name", card.get("name", "")))
+                in success_names
+            }
+            zoned_success_names = {
+                str((card.get("definition") or {}).get("name", card.get("name", "")))
+                for player in state.get("players", [])
+                if isinstance(player, dict)
+                for zone in matchup.success_zones
+                for card in player.get(zone, [])
+                if isinstance(card, dict)
+            }
+            success_event = any(
+                isinstance(event, dict)
+                and str(event.get("cardInstanceId", "")) in success_instance_ids
+                and str(event.get("kind", ""))
+                in {"spellCast", "permanentEnteredBattlefield", "tokenCreated"}
+                for event in state.get("events", [])
+            )
+            if zoned_success_names.intersection(success_names) or success_event:
+                sequence_complete = (
+                    not matchup.success_action_sequence
+                    or self.objective_milestones_completed
+                    == len(matchup.success_action_sequence)
+                )
+                if sequence_complete:
+                    self.objective_completed = True
+                    step = DecisionStep(dict(state), [], 1.0, True, self.learner_player_id)
+                    self._remove_session()
+                    return step
         terminal = decision is None
         if terminal:
-            state = view.get("state", {})
             if view.get("matchState") is not None:
                 state = dict(state)
                 state["_matchState"] = view.get("matchState")
@@ -237,6 +629,19 @@ class RustSessionEnvironment:
                 if self.learner_player_id in winners
                 else (-1.0 if self.learner_player_id in losers else 0.0)
             )
+            if (
+                reward == 0.0
+                and state.get("status") == "turnLimitReached"
+                and matchup
+                and matchup.anchor_deadline_round
+            ):
+                reward = -1.0
+            if reward > 0 and matchup and matchup.objective in {"fast-win", "combo-win"}:
+                turn_number = int(state.get("turnNumber", 0) or 0)
+                round_number = max(1, (turn_number + 1) // 2)
+                target_round = matchup.target_round or matchup.anchor_deadline_round
+                if target_round:
+                    reward += max(0.0, (target_round - round_number) / target_round)
             step = DecisionStep(view.get("state", {}), [], reward, True)
             self._remove_session()
             return step
@@ -250,7 +655,7 @@ class RustSessionEnvironment:
         state = self._decorate_observation(state, decision.get("playerId"))
         return DecisionStep(
             state,
-            expand_policy_actions(decision),
+            self._policy_actions(decision),
             reward,
             False,
             decision.get("playerId"),
@@ -261,7 +666,37 @@ class RustSessionEnvironment:
         self.known_decks_by_player_id = {}
         self.pregame_commanders = []
         self.previous_observations_by_player_id = {}
+        self.objective_completed = False
+        self.objective_action_labels = []
+        self.objective_milestones_completed = 0
+        self.opening_hand_selected_card_names = []
+        self.opening_hand_roles_available = 0
+        self.objective_damage_progress = 0.0
+        self.sideboard_cards_selected = 0
+        self.sideboard_target_cards_selected = 0
+        self.sideboard_cut_cards_selected = 0
         matchup = self.matchups[matchup_id]
+        self.sideboard_target_cards_available = sum(
+            1
+            for player in matchup.setup.get("players", [])
+            if str(player.get("id", "")) == matchup.learner_player_id
+            for card in player.get("cards", [])
+            if isinstance(card, dict)
+            and bool(card.get("isSideboard"))
+            and str(card.get("name", "")) in set(matchup.sideboard_target_card_names)
+        )
+        self.sideboard_cut_cards_expected = min(
+            self.sideboard_target_cards_available,
+            sum(
+                1
+                for player in matchup.setup.get("players", [])
+                if str(player.get("id", "")) == matchup.learner_player_id
+                for card in player.get("cards", [])
+                if isinstance(card, dict)
+                and not bool(card.get("isSideboard"))
+                and str(card.get("name", "")) in set(matchup.sideboard_cut_card_names)
+            ),
+        )
         self.current_matchup = matchup
         setup = dict(matchup.setup)
         if seat_swap:
@@ -310,28 +745,42 @@ class RustSessionEnvironment:
                     if matchup.anchor_opening_hand_pool_size is not None
                     else {}
                 ),
+                "fixedOpeningHandDefinitionIdsByPlayerId": (
+                    {
+                        self.learner_player_id: list(
+                            matchup.fixed_opening_hand_definition_ids
+                        )
+                    }
+                    if matchup.fixed_opening_hand_definition_ids
+                    else {}
+                ),
                 "trainingAnchorDeadlineRoundByPlayerId": {
                     player_id: matchup.anchor_deadline_round
                     for player_id in matchup.training_anchor_player_ids
                     if matchup.anchor_deadline_round is not None
                 },
+                "startWithSideboarding": matchup.start_with_sideboarding,
             },
         )
         response.raise_for_status()
         self.current_view = response.json()
+        self._start_replay(self.current_view)
         self._capture_known_decks(self.current_view)
         self.session_id = self.current_view["sessionId"]
-        return self._to_step(self.current_view)
+        step = self._to_step(self.current_view)
+        self._initialize_opening_hand_roles(step)
+        return step
 
     def step(self, action_index: int) -> DecisionStep:
         if self.current_view is None or self.session_id is None:
             raise RuntimeError("environment must be reset before step")
         decision = self.current_view["decision"]
-        options = expand_policy_actions(decision)
+        options = self._policy_actions(decision)
         if action_index < 0 or action_index >= len(options):
             raise IndexError("selected action index is outside the current legal action list")
         try:
             selected_action = options[action_index]
+            self._record_replay_action(selected_action)
             submission = {
                 "revision": self.current_view["revision"],
                 "decisionId": decision["id"],
@@ -342,6 +791,16 @@ class RustSessionEnvironment:
             }
             if "_numberValue" in selected_action:
                 submission["numberValue"] = selected_action["_numberValue"]
+            if "_cardInstanceIds" in selected_action:
+                submission["cardInstanceIds"] = selected_action["_cardInstanceIds"]
+            choice = decision.get("choice")
+            if isinstance(choice, dict) and choice.get("kind") == "cardNameSelection":
+                decision_id = str(choice.get("decisionId", ""))
+                selected_value = (selected_action.get("decisions") or {}).get(decision_id)
+                if isinstance(selected_value, list) and selected_value:
+                    selected_value = selected_value[0]
+                if isinstance(selected_value, str) and selected_value.strip():
+                    submission["cardName"] = selected_value.strip()
             response = self.client.post(
                 f"/game/sessions/{self.session_id}/actions",
                 json=submission,
@@ -360,8 +819,82 @@ class RustSessionEnvironment:
                 f"action={selected_action.get('id')}, actionKind={selected_action.get('kind')}): "
                 f"{error_text}"
             )
-        self.current_view = response.json()
-        return self._to_step(self.current_view)
+        previous_milestones = self.objective_milestones_completed
+        self.objective_action_labels.append(str(selected_action.get("label", "")))
+        if str(decision.get("kind", "")) == "openingHandSelection":
+            selected_card_name = self._opening_hand_card_name(selected_action)
+            if selected_card_name:
+                self.opening_hand_selected_card_names.append(selected_card_name)
+        self.objective_milestones_completed = (
+            self._opening_hand_role_progress()
+            if self.current_matchup and self.current_matchup.opening_hand_target_roles
+            else self._objective_sequence_progress()
+        )
+        milestone_reward = 0.1 * max(
+            0,
+            self.objective_milestones_completed - previous_milestones,
+        )
+        sideboard_reward = 0.0
+        if str(decision.get("kind", "")) == "sideboarding":
+            previous_sideboard_count = self.sideboard_cards_selected
+            self.sideboard_cards_selected = max(
+                self.sideboard_cards_selected,
+                self._sideboard_cards_brought_in(selected_action),
+            )
+            if self.sideboard_cards_selected > previous_sideboard_count:
+                if self.current_matchup and self.current_matchup.sideboard_target_card_names:
+                    self.sideboard_target_cards_selected = max(
+                        self.sideboard_target_cards_selected,
+                        self._sideboard_target_cards_brought_in(selected_action),
+                    )
+                    self.sideboard_cut_cards_selected = max(
+                        self.sideboard_cut_cards_selected,
+                        self._sideboard_cut_cards_taken_out(selected_action),
+                    )
+                    coverage = self.sideboard_target_cards_selected / max(
+                        1, self.sideboard_target_cards_available
+                    )
+                    if self.sideboard_cut_cards_expected:
+                        coverage = 0.5 * (
+                            coverage
+                            + self.sideboard_cut_cards_selected
+                            / self.sideboard_cut_cards_expected
+                        )
+                    sideboard_reward = 0.3 * coverage
+                else:
+                    sideboard_reward = min(0.2, self.sideboard_cards_selected * 0.04)
+        next_view = response.json()
+        session_error = next_view.get("error")
+        if session_error:
+            action_context = {
+                "decision": decision.get("id"),
+                "decisionKind": decision.get("kind"),
+                "action": selected_action.get("id"),
+                "engineAction": selected_action.get("_engineActionId"),
+                "actionKind": selected_action.get("kind"),
+                "actionLabel": selected_action.get("label"),
+                "cardInstanceId": selected_action.get("cardInstanceId"),
+            }
+            self._remove_session()
+            raise RuntimeError(
+                "Rust session failed after published action "
+                f"{json.dumps(action_context, sort_keys=True)}: {session_error}"
+            )
+        self.current_view = next_view
+        previous_damage_progress = self.objective_damage_progress
+        self.objective_damage_progress = max(
+            self.objective_damage_progress,
+            self._damage_progress(self.current_view),
+        )
+        damage_reward = 0.2 * max(
+            0.0,
+            self.objective_damage_progress - previous_damage_progress,
+        )
+        self._record_replay_view(self.current_view)
+        return self._to_step(
+            self.current_view,
+            reward=milestone_reward + sideboard_reward + damage_reward,
+        )
 
 
 class RustSelfPlayEnvironment(RustSessionEnvironment):
@@ -594,7 +1127,37 @@ class RustSelfPlayEnvironment(RustSessionEnvironment):
         self.known_decks_by_player_id = {}
         self.pregame_commanders = []
         self.previous_observations_by_player_id = {}
+        self.objective_completed = False
+        self.objective_action_labels = []
+        self.objective_milestones_completed = 0
+        self.opening_hand_selected_card_names = []
+        self.opening_hand_roles_available = 0
+        self.objective_damage_progress = 0.0
+        self.sideboard_cards_selected = 0
         matchup = self.matchups[matchup_id]
+        self.sideboard_target_cards_selected = 0
+        self.sideboard_cut_cards_selected = 0
+        self.sideboard_target_cards_available = sum(
+            1
+            for player in matchup.setup.get("players", [])
+            if str(player.get("id", "")) == matchup.learner_player_id
+            for card in player.get("cards", [])
+            if isinstance(card, dict)
+            and bool(card.get("isSideboard"))
+            and str(card.get("name", "")) in set(matchup.sideboard_target_card_names)
+        )
+        self.sideboard_cut_cards_expected = min(
+            self.sideboard_target_cards_available,
+            sum(
+                1
+                for player in matchup.setup.get("players", [])
+                if str(player.get("id", "")) == matchup.learner_player_id
+                for card in player.get("cards", [])
+                if isinstance(card, dict)
+                and not bool(card.get("isSideboard"))
+                and str(card.get("name", "")) in set(matchup.sideboard_cut_card_names)
+            ),
+        )
         self.current_matchup = matchup
         setup = dict(matchup.setup)
         players = list(setup.get("players", []))
@@ -638,18 +1201,31 @@ class RustSelfPlayEnvironment(RustSessionEnvironment):
                     if matchup.anchor_opening_hand_pool_size is not None
                     else {}
                 ),
+                "fixedOpeningHandDefinitionIdsByPlayerId": (
+                    {
+                        matchup.learner_player_id: list(
+                            matchup.fixed_opening_hand_definition_ids
+                        )
+                    }
+                    if matchup.fixed_opening_hand_definition_ids
+                    else {}
+                ),
                 "trainingAnchorDeadlineRoundByPlayerId": {
                     player_id: matchup.anchor_deadline_round
                     for player_id in matchup.training_anchor_player_ids
                     if matchup.anchor_deadline_round is not None
                 },
+                "startWithSideboarding": matchup.start_with_sideboarding,
             },
         )
         response.raise_for_status()
         self.current_view = response.json()
+        self._start_replay(self.current_view)
         self._capture_known_decks(self.current_view)
         self.session_id = self.current_view["sessionId"]
-        return self._to_step(self.current_view)
+        step = self._to_step(self.current_view)
+        self._initialize_opening_hand_roles(step)
+        return step
 
 
 class TinySelfPlayEnvironment:

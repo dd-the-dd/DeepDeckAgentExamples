@@ -34,7 +34,15 @@ from .dependencies import current_revision, engine_binary, engine_build_current,
 from .resources import active_games, find_model_run, load_resource_plan, resource_snapshot
 
 MAX_LOG_LINES = 500
-TRAINING_KINDS = {"training.smoke", "training.dataset", "training.pool"}
+PUBLIC_LOG_LINES = 20
+MAX_PUBLIC_LOG_LINE_CHARS = 2_000
+MAX_RANDOM_SEED = 2**31 - 1
+TRAINING_KINDS = {
+    "training.smoke",
+    "training.dataset",
+    "training.pool",
+    "training.v13-world-model",
+}
 PLAYTEST_KIND = "playtest.agent"
 MATCHMAKING_KIND = "matchmaking.agent"
 DEPENDENCY_KINDS = {
@@ -48,6 +56,18 @@ SUPPORTED_KINDS = TRAINING_KINDS | {PLAYTEST_KIND, MATCHMAKING_KIND} | DEPENDENC
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def public_logs(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple, deque)):
+        return []
+    lines = [str(value) for value in values][-PUBLIC_LOG_LINES:]
+    return [
+        line
+        if len(line) <= MAX_PUBLIC_LOG_LINE_CHARS
+        else f"{line[:MAX_PUBLIC_LOG_LINE_CHARS]}... [truncated]"
+        for line in lines
+    ]
 
 
 def is_loopback_url(value: str) -> bool:
@@ -91,7 +111,7 @@ class Job:
             "finished_at": self.finished_at,
             "exit_code": self.exit_code,
             "artifact_path": self.artifact_path,
-            "logs": list(self.logs),
+            "logs": public_logs(self.logs),
             "model_id": self.model_id,
             "worker_slots": self.worker_slots,
             "details": self.details,
@@ -127,7 +147,14 @@ class JobManager:
             if any(item.get("status") == "running" for item in stored)
             else []
         )
-        persisted = [self._reconcile_persisted_job(item, live_commands) for item in stored]
+        persisted = [
+            {
+                **reconciled,
+                "logs": public_logs(reconciled.get("logs", [])),
+            }
+            for item in stored
+            for reconciled in [self._reconcile_persisted_job(item, live_commands)]
+        ]
         merged = {item["id"]: item for item in persisted}
         merged.update(current)
         return sorted(merged.values(), key=lambda item: item["created_at"], reverse=True)[:100]
@@ -235,11 +262,13 @@ class JobManager:
 
     def prepare_model(self, raw: dict[str, Any]) -> str:
         model = str(raw.get("model", "v12"))
-        if model not in {"v11", "v12"}:
-            raise JobValidationError("Model must be v11 or v12.")
+        if model not in {"v11", "v12", "v13"}:
+            raise JobValidationError("Model must be v11, v12, or v13.")
         self._local_model_name(raw)
         self._bounded_int(raw, "parallel_matches", default=1, minimum=1, maximum=32)
         self._bounded_int(raw, "gpu_memory_mb", default=0, minimum=0, maximum=24 * 1024)
+        if model == "v13":
+            return self._prepare_v13_model(raw)
         _, _, run = self._pool_training_command(model, raw)
         control = run / "training-control.json"
         control.write_text(
@@ -248,6 +277,74 @@ class JobManager:
         )
         metadata = json.loads((run / "local-model.json").read_text(encoding="utf-8"))
         return str(metadata["id"])
+
+    def _prepare_v13_model(self, raw: dict[str, Any]) -> str:
+        try:
+            import yaml
+        except ModuleNotFoundError as error:
+            raise JobValidationError(
+                "Install DeepDeckLearner's deep-learning dependencies."
+            ) from error
+        model_name = self._local_model_name(raw)
+        now = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+        slug = re.sub(r"[^a-z0-9]+", "-", model_name.casefold()).strip("-") or "v13-agent"
+        model_id = f"{slug[:40]}-{now.lower()}"
+        run = self.root / ".deepdeck" / "runs" / f"{now}-{slug[:40]}-v13"
+        run.mkdir(parents=True, exist_ok=False)
+        template = self.root / "configs" / "oracle-ai" / "v13-world-model-smoke.yaml"
+        if not template.is_file():
+            raise JobValidationError("The V13 world-model configuration is unavailable.")
+        config = yaml.safe_load(template.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise JobValidationError("The V13 world-model configuration is invalid.")
+        config["name"] = model_name
+        config["outputDir"] = str(run)
+        training = config.setdefault("training", {})
+        training["seed"] = self._random_seed()
+        training["steps"] = self._bounded_int(
+            raw, "training_steps", default=1000, minimum=1, maximum=1_000_000
+        )
+        config_path = run / "training-config.yaml"
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        resource_plan = {
+            "trainingMatches": 1,
+            "leagueMatches": 0,
+            "localMatches": 1,
+            "gpuMemoryMb": self._bounded_int(
+                raw, "gpu_memory_mb", default=0, minimum=0, maximum=24 * 1024
+            ),
+        }
+        (run / "learner-resources.json").write_text(
+            json.dumps(resource_plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        metadata = {
+            "schemaVersion": "local-model/v1",
+            "id": model_id,
+            "name": model_name,
+            "architecture": "v13",
+            "format": "legacy",
+            "description": "V13 structured Transformer world-model training agent.",
+            "createdAt": utc_now(),
+            "checkpointPath": str(run / "checkpoints" / f"step-{training['steps']}"),
+            "reservePlaytest": True,
+            "selfPlayAllSeats": False,
+            "source": "user-trained",
+            "decks": [],
+            "resourcePlan": resource_plan,
+            "agentSdkRuntime": {
+                "module": "deepdeck_examples.run",
+                "arguments": ["v13"],
+                "checkpointArgument": "--checkpoint",
+                "requiredFiles": ["rl-model.pt"],
+            },
+        }
+        (run / "local-model.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (run / "training-control.json").write_text(
+            json.dumps({"desiredState": "paused"}, indent=2) + "\n", encoding="utf-8"
+        )
+        return model_id
 
     def update_model(self, model_id: str, raw: dict[str, Any]) -> str:
         if self.model_has_active_workers(model_id):
@@ -363,6 +460,23 @@ class JobManager:
             {"self": 1.0} if shared_self_play else {"self": 0.5, "anchor": 0.5}
         )
         config["serviceRefreshEvery"] = 1 if reserve_playtest else 1_000_000
+        if str(metadata.get("architecture", "")).casefold() == "v13":
+            config["deckCatalog"] = str(run / "training-decks.json")
+            config.setdefault("engineUrl", "http://127.0.0.1:8787")
+            config.setdefault("engineTimeoutSeconds", 300)
+            config["savedGameLimit"] = int(config.get("savedGameLimit", 20))
+            config["trainingScenarioRandomizer"] = {
+                "formats": ["legacy"],
+                "formatSampling": "roundRobin",
+                "playerCounts": [2],
+                "maxTurns": 80,
+                "matchmaking": {"enabled": False},
+            }
+            rl = config.setdefault("rl", {})
+            rl["environment"] = "engine"
+            rl.setdefault("evaluation_every_updates", 10)
+            rl.setdefault("evaluation_games", 4)
+            rl.setdefault("max_consecutive_errors", 10)
         metadata.update(
             {
                 "name": model_name,
@@ -399,7 +513,8 @@ class JobManager:
         worker_slots: int
         if kind == "training.pool" and str(raw.get("model_id", "")).strip():
             model_id = str(raw["model_id"]).strip()
-            argv, label, artifact = self._existing_pool_training_command(model_id)
+            requested_phase = str(raw.get("phase_id", "")).strip() or None
+            argv, label, artifact = self._existing_pool_training_command(model_id, requested_phase)
             deferred_payload = None
             plan = load_resource_plan(artifact)
             if plan["trainingMatches"] <= 0:
@@ -497,14 +612,33 @@ class JobManager:
             job = self._jobs.get(job_id)
             process = job.process if job else None
         if not job:
+            workers = self.resources().get("workers", [])
             worker = next(
-                (
-                    item
-                    for item in self.resources().get("workers", [])
-                    if item.get("jobId") == job_id and str(job_id).startswith("recovered-")
-                ),
+                (item for item in workers if item.get("jobId") == job_id),
                 None,
             )
+            # After a controller restart, persisted jobs keep their original id while
+            # resource discovery identifies the still-running process as recovered-PID.
+            # Reconnect the two when there is exactly one safe model/kind match.
+            if not worker:
+                persisted = next(
+                    (
+                        item
+                        for item in self.list_jobs()
+                        if item.get("id") == job_id and item.get("status") == "running"
+                    ),
+                    None,
+                )
+                candidates = [
+                    item
+                    for item in workers
+                    if str(item.get("jobId", "")).startswith("recovered-")
+                    and persisted
+                    and item.get("kind") == persisted.get("kind")
+                    and item.get("modelId") == persisted.get("model_id")
+                ]
+                if len(candidates) == 1:
+                    worker = candidates[0]
             if not worker:
                 return None
             pids = [int(pid) for pid in worker.get("pids", []) if int(pid) > 0]
@@ -680,13 +814,37 @@ class JobManager:
         )
 
     def _training_command(self, kind: str, raw: dict[str, Any]) -> tuple[list[str], str, Path]:
+        if kind == "training.v13-world-model":
+            config = self.root / "configs" / "oracle-ai" / "v13-world-model-smoke.yaml"
+            if not config.is_file():
+                raise JobValidationError("The V13 world-model configuration is unavailable.")
+            target = self.root / ".deepdeck" / "runs" / f"v13-world-model-{uuid.uuid4().hex[:8]}"
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    "oracle_ai.training.world_model",
+                    "--config",
+                    str(config),
+                    "--output",
+                    str(target),
+                ],
+                "V13 structured world-model smoke",
+                target,
+            )
         model = str(raw.get("model", "v12"))
         if model not in {"v11", "v12"}:
             raise JobValidationError("Model must be v11 or v12.")
         if kind == "training.pool":
             return self._pool_training_command(model, raw)
         epochs = self._bounded_int(raw, "epochs", default=3, minimum=1, maximum=1000)
-        seed = self._bounded_int(raw, "seed", default=1, minimum=0, maximum=2**31 - 1)
+        seed = self._bounded_int(
+            raw,
+            "seed",
+            default=self._random_seed(),
+            minimum=0,
+            maximum=MAX_RANDOM_SEED,
+        )
         learning_rate = self._bounded_float(
             raw, "learning_rate", default=0.0003, minimum=1e-8, maximum=1.0
         )
@@ -769,6 +927,11 @@ class JobManager:
             / ("league-v12-legacy.yaml" if model == "v12" else "league-v11-alphastar.yaml")
         )
         config = yaml.safe_load(template.read_text(encoding="utf-8"))
+        config["seed"] = self._random_seed()
+        config["trainingSeed"] = self._random_seed()
+        evaluation = config.get("evaluation")
+        if isinstance(evaluation, dict):
+            evaluation["seed"] = self._random_seed()
         engine_url = str(config.get("engineUrl", "http://127.0.0.1:8787"))
         catalog: dict[str, list[dict[str, Any]]] = {}
         for deck in compatible:
@@ -906,6 +1069,12 @@ class JobManager:
             "baseCheckpointPath": str(base_model) if base_model is not None else None,
             "decks": compatible,
             "resourcePlan": resource_plan,
+            "agentSdkRuntime": {
+                "module": "deepdeck_examples.run",
+                "arguments": [model],
+                "checkpointArgument": "--checkpoint",
+                "requiredFiles": ["manifest.json", "checkpoint.pt"],
+            },
         }
         (run / "local-model.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -914,7 +1083,9 @@ class JobManager:
         deck_label = "deck" if len(compatible) == 1 else "decks"
         return argv, f"{model_name} · {model.upper()} · {len(compatible)} {deck_label}", run
 
-    def _existing_pool_training_command(self, model_id: str) -> tuple[list[str], str, Path]:
+    def _existing_pool_training_command(
+        self, model_id: str, requested_phase: str | None = None
+    ) -> tuple[list[str], str, Path]:
         try:
             import yaml
         except ModuleNotFoundError as error:
@@ -938,6 +1109,82 @@ class JobManager:
             ) from error
         if not isinstance(config, dict):
             raise JobValidationError("This agent's training configuration is invalid.")
+        if str(metadata.get("architecture", "")).casefold() == "v13":
+            supported_phases = {
+                "world-model",
+                "reinforcement-learning",
+                "engine-evaluation",
+            }
+            if requested_phase is not None and requested_phase not in supported_phases:
+                raise JobValidationError(
+                    f"V13 does not publish a training phase named {requested_phase}."
+                )
+            (run / "training-control.json").write_text(
+                json.dumps({"desiredState": "running"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            training_config = config.get("training", {})
+            world_steps = int(training_config.get("steps", 0) or 0)
+            rl_config = config.get("rl", {})
+            rl_episodes = int(rl_config.get("episodes", 10_000) or 0)
+            curriculum_config = config.get("trainingCurriculum", {})
+            curriculum_enabled = bool(
+                isinstance(curriculum_config, dict) and curriculum_config.get("enabled", False)
+            )
+            rl_label = "adaptive scenario curriculum" if curriculum_enabled else "PPO self-play"
+            world_checkpoint = run / "checkpoints" / f"step-{world_steps}" / "world-model.pt"
+            available_world_checkpoint = world_checkpoint.is_file() or any(
+                (run / "checkpoints").glob("step-*/world-model.pt")
+            )
+            extra_args: list[str] = []
+            if requested_phase == "world-model":
+                module = "oracle_ai.training.world_model"
+                phase_label = "world model"
+            elif requested_phase == "reinforcement-learning":
+                if not available_world_checkpoint:
+                    raise JobValidationError(
+                        "Train a V13 world-model checkpoint before starting reinforcement learning."
+                    )
+                module = "oracle_ai.training.rl_v13"
+                phase_label = rl_label
+            elif requested_phase == "engine-evaluation":
+                if not available_world_checkpoint:
+                    raise JobValidationError(
+                        "Train a V13 world-model checkpoint before starting Engine evaluation."
+                    )
+                if not (run / "v13-engine-baseline.pt").is_file():
+                    raise JobValidationError(
+                        "Run V13 Engine self-play once before starting a standalone evaluation."
+                    )
+                module = "oracle_ai.training.rl_v13"
+                extra_args = ["--evaluate-only"]
+                phase_label = "Engine evaluation"
+            elif world_steps > 0 and not world_checkpoint.is_file():
+                module = "oracle_ai.training.world_model"
+                phase_label = "world model"
+            elif rl_episodes > 0 and available_world_checkpoint:
+                module = "oracle_ai.training.rl_v13"
+                phase_label = rl_label
+            elif rl_episodes > 0:
+                raise JobValidationError(
+                    "Train a V13 world-model checkpoint before starting reinforcement learning."
+                )
+            else:
+                raise JobValidationError("Enable at least one unfinished V13 training stage.")
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    module,
+                    "--config",
+                    str(config_path),
+                    "--output",
+                    str(run),
+                    *extra_args,
+                ],
+                f"{metadata.get('name', model_id)} · V13 · {phase_label}",
+                run,
+            )
         checkpoint = Path(str(metadata.get("checkpointPath", "")))
         resumable = (checkpoint / "manifest.json").is_file() and (
             checkpoint / "checkpoint.pt"
@@ -982,6 +1229,10 @@ class JobManager:
         if not 2 <= len(name) <= 64 or any(ord(character) < 32 for character in name):
             raise JobValidationError("Model name must contain between 2 and 64 visible characters.")
         return name
+
+    @staticmethod
+    def _random_seed() -> int:
+        return random.SystemRandom().randrange(MAX_RANDOM_SEED + 1)
 
     @staticmethod
     def _card_identifier(card: dict[str, Any]) -> str:
@@ -1064,7 +1315,7 @@ class JobManager:
         return target
 
     def _playtest_command(self, raw: dict[str, Any]) -> tuple[list[str], str, None]:
-        example, checkpoint_path, model_name = self._owned_model(raw)
+        runtime_command, checkpoint_path, model_name, checkpoint_argument = self._owned_model(raw)
         engine_url = str(raw.get("engine_url", "http://127.0.0.1:8787"))
         if not is_loopback_url(engine_url):
             raise JobValidationError("Local playtesting requires a loopback Engine URL.")
@@ -1185,7 +1436,7 @@ class JobManager:
                             },
                         ],
                     },
-                    "seed": 1,
+                    "seed": self._random_seed(),
                     "gameMode": game_format,
                     "maxTurns": 200,
                     "humanPlayerIds": ["local-human"],
@@ -1202,10 +1453,7 @@ class JobManager:
             encoding="utf-8",
         )
         argv = [
-            sys.executable,
-            "-m",
-            "deepdeck_examples.run",
-            example,
+            *runtime_command,
             "--target",
             "local",
             "--engine-url",
@@ -1216,7 +1464,7 @@ class JobManager:
             "--local-format",
             game_format,
         ]
-        argv.extend(["--checkpoint", str(checkpoint_path)])
+        argv.extend([checkpoint_argument, str(checkpoint_path)])
         raw["_job_details"] = {
             "engineUrl": engine_url,
             "playerDeck": {"id": own_deck, "name": own_name},
@@ -1327,9 +1575,7 @@ class JobManager:
             metadata = json.loads((run / "local-model.json").read_text(encoding="utf-8"))
             decks = metadata.get("decks", [])
             ids = {
-                str(deck.get("id"))
-                for deck in decks
-                if isinstance(deck, dict) and deck.get("id")
+                str(deck.get("id")) for deck in decks if isinstance(deck, dict) and deck.get("id")
             }
             if ids:
                 return ids
@@ -1349,7 +1595,7 @@ class JobManager:
             raise JobValidationError(
                 "Add DEEPDECK_API_KEY to the project .env and restart DeepDeckLearner."
             )
-        example, checkpoint_path, model_name = self._owned_model(raw)
+        runtime_command, checkpoint_path, model_name, checkpoint_argument = self._owned_model(raw)
         competition = str(raw.get("competition_version_id", "")).strip()
         deck_ids = raw.get("deck_version_ids")
         decks = (
@@ -1363,13 +1609,10 @@ class JobManager:
         speed = str(raw.get("speed", "1s"))
         if speed not in {"100ms", "1s", "10s"}:
             raise JobValidationError("Speed must be 100ms, 1s, or 10s.")
-        if example in {"v11", "v12"} and speed == "100ms":
+        if str(raw.get("agent", "")) in {"v11", "v12"} and speed == "100ms":
             speed = "1s"
         argv = [
-            sys.executable,
-            "-m",
-            "deepdeck_examples.run",
-            example,
+            *runtime_command,
             "--target",
             "ddl",
             "--speed",
@@ -1385,41 +1628,67 @@ class JobManager:
             argv.extend(["--additional-deck-version-id", deck])
         if not bool(raw.get("continuous", False)):
             argv.append("--once")
-        argv.extend(["--checkpoint", str(checkpoint_path)])
+        argv.extend([checkpoint_argument, str(checkpoint_path)])
         return argv, f"{model_name} · Deep Deck League", None
 
-    def _owned_model(self, raw: dict[str, Any]) -> tuple[str, Path, str]:
-        architecture = str(raw.get("agent", ""))
-        if architecture not in {"v11", "v12"}:
-            raise JobValidationError("Choose one of your locally trained V11 or V12 models.")
-        checkpoint = Path(str(raw.get("checkpoint", ""))).expanduser().resolve()
+    def _owned_model(self, raw: dict[str, Any]) -> tuple[list[str], Path, str, str]:
+        model_id = str(raw.get("model_id", "")).strip()
+        try:
+            _run, metadata = find_model_run(self.root, model_id)
+        except ValueError as error:
+            raise JobValidationError("The selected local model metadata is unavailable.") from error
+        architecture = str(metadata.get("architecture", ""))
+        checkpoint = Path(str(metadata.get("checkpointPath", ""))).expanduser().resolve()
         runs_root = (self.root / ".deepdeck" / "runs").resolve()
         try:
             checkpoint.relative_to(runs_root)
         except ValueError as error:
             raise JobValidationError("Choose a model created by this Learner workspace.") from error
-        metadata_path = checkpoint.parent.parent / "local-model.json"
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise JobValidationError("The selected local model metadata is unavailable.") from error
         if metadata.get("source") == "local-frozen-checkpoint":
             raise JobValidationError(
                 "Choose an agent trained in this workspace, not a reference implementation."
             )
-        if (
-            metadata.get("architecture") != architecture
-            or Path(str(metadata.get("checkpointPath", ""))).resolve() != checkpoint
-        ):
-            raise JobValidationError("The selected local model does not match its checkpoint.")
-        if str(raw.get("model_id", "")).strip() != str(metadata.get("id", "")):
-            raise JobValidationError("Choose the registered identity of your local model.")
-        if (
-            not (checkpoint / "manifest.json").is_file()
-            or not (checkpoint / "checkpoint.pt").is_file()
-        ):
+        runtime = metadata.get("agentSdkRuntime")
+        if isinstance(runtime, dict):
+            module = runtime.get("module")
+            arguments = runtime.get("arguments", [])
+            checkpoint_argument = runtime.get("checkpointArgument", "--checkpoint")
+            required_files = runtime.get("requiredFiles", [])
+            if (
+                not isinstance(module, str)
+                or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module)
+                or not isinstance(arguments, list)
+                or not all(isinstance(value, str) for value in arguments)
+                or not isinstance(checkpoint_argument, str)
+                or not checkpoint_argument.startswith("--")
+                or not isinstance(required_files, list)
+                or not required_files
+                or not all(isinstance(value, str) for value in required_files)
+            ):
+                raise JobValidationError("This model's Agent SDK runtime descriptor is invalid.")
+        else:
+            # Models created before the SDK runtime contract keep working.
+            module = "deepdeck_examples.run"
+            arguments = [architecture]
+            checkpoint_argument = "--checkpoint"
+            required_files = (
+                ["rl-model.pt"] if architecture == "v13" else ["manifest.json", "checkpoint.pt"]
+            )
+        checkpoint_ready = all(
+            not Path(value).is_absolute()
+            and ".." not in Path(value).parts
+            and (checkpoint / value).is_file()
+            for value in required_files
+        )
+        if not checkpoint_ready:
             raise JobValidationError("This model is still preparing its first playable weights.")
-        return architecture, checkpoint, str(metadata.get("name", architecture.upper()))
+        command = [sys.executable, "-m", module, *arguments]
+        return (
+            command,
+            checkpoint,
+            str(metadata.get("name", architecture.upper())),
+            checkpoint_argument,
+        )
 
     @staticmethod
     def _bounded_int(

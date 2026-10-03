@@ -19,6 +19,7 @@ type EngineAction = {
 };
 
 export type EngineView = {
+  schemaVersion?: string;
   sessionId: string;
   revision: number;
   state?: {
@@ -112,6 +113,14 @@ async function submitSessionAction(
   return response.json() as Promise<EngineView>;
 }
 
+// Polling and action requests can overlap. Never let a slower GET response
+// replace the newer state returned by an action that just completed.
+// eslint-disable-next-line react-refresh/only-export-components -- exported for race-condition coverage.
+export function latestEngineView(current: EngineView | null, incoming: EngineView) {
+  if (!current || current.sessionId !== incoming.sessionId) return incoming;
+  return incoming.revision >= current.revision ? incoming : current;
+}
+
 function LoadingTable({ label }: { label: string }) {
   return (
     <div className="game-loading-visual" role="status" aria-live="polite">
@@ -139,11 +148,15 @@ export default function LocalPixiTable({ deckVersionIds = [], engineUrl, session
   const [deckSelections, setDeckSelections] = useState<DeckPresentation[]>([]);
   const deckVersionIdsKey = deckVersionIds.join("|");
 
+  const acceptView = useCallback((incoming: EngineView) => {
+    setView((current) => latestEngineView(current, incoming));
+  }, []);
+
   const refresh = useCallback(async () => {
     const next = await readSession(engineUrl, sessionId);
-    setView(next);
+    acceptView(next);
     setError("");
-  }, [engineUrl, sessionId]);
+  }, [acceptView, engineUrl, sessionId]);
 
   const leave = useCallback(async () => {
     try {
@@ -162,7 +175,7 @@ export default function LocalPixiTable({ deckVersionIds = [], engineUrl, session
     setBusy(true);
     setError("");
     try {
-      setView(await submitSessionAction(engineUrl, view, actionId, extra));
+      acceptView(await submitSessionAction(engineUrl, view, actionId, extra));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The action was rejected.");
       try {
@@ -173,7 +186,7 @@ export default function LocalPixiTable({ deckVersionIds = [], engineUrl, session
     } finally {
       setBusy(false);
     }
-  }, [busy, engineUrl, refresh, view]);
+  }, [acceptView, busy, engineUrl, refresh, view]);
 
   useEffect(() => {
     let active = true;
@@ -181,7 +194,7 @@ export default function LocalPixiTable({ deckVersionIds = [], engineUrl, session
       try {
         const next = await readSession(engineUrl, sessionId);
         if (active) {
-          setView(next);
+          acceptView(next);
           setError("");
         }
       } catch (reason) {
@@ -196,7 +209,7 @@ export default function LocalPixiTable({ deckVersionIds = [], engineUrl, session
       active = false;
       window.clearInterval(timer);
     };
-  }, [engineUrl, sessionId]);
+  }, [acceptView, engineUrl, sessionId]);
 
   useEffect(() => {
     let active = true;

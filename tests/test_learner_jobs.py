@@ -9,8 +9,19 @@ import httpx
 import pytest
 import yaml
 
-from deepdeck_learner.card_models import enrich_card_characteristics, oracle_request
-from deepdeck_learner.jobs import Job, JobManager, JobValidationError, is_loopback_url
+from deepdeck_learner.card_models import (
+    compile_oracle_rules,
+    enrich_card_characteristics,
+    oracle_request,
+)
+from deepdeck_learner.jobs import (
+    MAX_PUBLIC_LOG_LINE_CHARS,
+    PUBLIC_LOG_LINES,
+    Job,
+    JobManager,
+    JobValidationError,
+    is_loopback_url,
+)
 
 
 def local_checkpoint(root: Path, architecture: str = "v12") -> Path:
@@ -70,6 +81,107 @@ def test_loopback_url_validation() -> None:
     assert not is_loopback_url("file:///tmp/engine")
 
 
+def test_owned_model_uses_agent_sdk_runtime_instead_of_architecture_allowlist(
+    tmp_path: Path,
+) -> None:
+    checkpoint = local_checkpoint(tmp_path, architecture="v-next")
+    (checkpoint / "sdk.weights").touch()
+    metadata_path = checkpoint.parent.parent / "local-model.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["agentSdkRuntime"] = {
+        "module": "future_agent.sdk_runner",
+        "arguments": ["serve"],
+        "checkpointArgument": "--weights",
+        "requiredFiles": ["sdk.weights"],
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    command, resolved_checkpoint, name, checkpoint_argument = JobManager(  # noqa: SLF001
+        tmp_path
+    )._owned_model(
+        {
+            "model_id": "my-local-ai",
+            # Client hints are deliberately stale: registered metadata is authoritative.
+            "agent": "v13",
+            "checkpoint": "not-the-registered-checkpoint",
+        }
+    )
+
+    assert command == [
+        sys.executable,
+        "-m",
+        "future_agent.sdk_runner",
+        "serve",
+    ]
+    assert resolved_checkpoint == checkpoint.resolve()
+    assert name == "My Local AI"
+    assert checkpoint_argument == "--weights"
+
+
+def test_public_job_logs_are_bounded_for_fast_dashboard_refreshes() -> None:
+    job = Job(id="job", kind="training.pool", label="Trainer", argv=[])
+    for index in range(PUBLIC_LOG_LINES + 5):
+        job.logs.append(f"line-{index}" + ("x" * MAX_PUBLIC_LOG_LINE_CHARS))
+
+    logs = job.public()["logs"]
+
+    assert len(logs) == PUBLIC_LOG_LINES
+    assert logs[0].startswith("line-5")
+    assert all(len(line) <= MAX_PUBLIC_LOG_LINE_CHARS + len("... [truncated]") for line in logs)
+
+
+def test_stop_reconnects_a_persisted_job_to_its_recovered_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = JobManager(tmp_path)
+    worker = {
+        "jobId": "recovered-42",
+        "modelId": "my-local-ai",
+        "kind": "playtest.agent",
+        "label": "Recovered local game",
+        "pids": [42],
+        "workerSlots": 1,
+    }
+    monkeypatch.setattr(manager, "resources", lambda: {"workers": [worker]})
+    monkeypatch.setattr(
+        manager,
+        "list_jobs",
+        lambda: [
+            {
+                "id": "original-job",
+                "status": "running",
+                "kind": "playtest.agent",
+                "model_id": "my-local-ai",
+            }
+        ],
+    )
+
+    terminated: list[int] = []
+
+    class RecoveredProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def terminate(self) -> None:
+            terminated.append(self.pid)
+
+        def kill(self) -> None:
+            raise AssertionError("A responsive process should not be killed.")
+
+    monkeypatch.setattr("deepdeck_learner.jobs.psutil.Process", RecoveredProcess)
+    monkeypatch.setattr(
+        "deepdeck_learner.jobs.psutil.wait_procs",
+        lambda processes, timeout: (processes, []),
+    )
+
+    stopped = manager.stop("original-job")
+
+    assert stopped is not None
+    assert stopped["id"] == "original-job"
+    assert stopped["status"] == "stopped"
+    assert terminated == [42]
+
+
 def test_league_match_markers_track_only_active_matches(tmp_path: Path) -> None:
     manager = JobManager(tmp_path)
     job = Job(
@@ -104,6 +216,79 @@ def test_smoke_command_is_argv_and_uses_current_python(tmp_path: Path) -> None:
     assert argv[argv.index("--device") + 1] == "cuda"
     assert label == "V12 smoke"
     assert artifact is not None and artifact.parent.is_dir() and not artifact.exists()
+
+
+def test_training_command_generates_a_seed_when_none_is_supplied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = JobManager(tmp_path)
+    monkeypatch.setattr(manager, "_random_seed", lambda: 8675309)
+
+    argv, _, _ = manager._training_command(  # noqa: SLF001
+        "training.smoke", {"model": "v12"}
+    )
+
+    assert argv[argv.index("--seed") + 1] == "8675309"
+
+
+def test_v13_world_model_training_uses_its_separate_trainer(tmp_path: Path) -> None:
+    config = tmp_path / "configs" / "oracle-ai" / "v13-world-model-smoke.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("training:\n  steps: 1\n", encoding="utf-8")
+    manager = JobManager(tmp_path)
+
+    argv, label, artifact = manager._training_command(  # noqa: SLF001
+        "training.v13-world-model", {}
+    )
+
+    assert argv[1:3] == ["-m", "oracle_ai.training.world_model"]
+    assert argv[argv.index("--config") + 1] == str(config)
+    assert argv[argv.index("--output") + 1] == str(artifact)
+    assert label == "V13 structured world-model smoke"
+
+
+def test_v13_agent_can_be_configured_without_a_deck_or_api_key(tmp_path: Path) -> None:
+    config = tmp_path / "configs" / "oracle-ai" / "v13-world-model-smoke.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "model:\n  latent_dim: 32\ntraining:\n  steps: 2\n",
+        encoding="utf-8",
+    )
+    manager = JobManager(tmp_path)
+
+    model_id = manager.prepare_model(
+        {"model": "v13", "model_name": "Graph Pilot", "training_steps": 3}
+    )
+    argv, label, run = manager._existing_pool_training_command(model_id)  # noqa: SLF001
+    metadata = json.loads((run / "local-model.json").read_text(encoding="utf-8"))
+
+    assert metadata["architecture"] == "v13"
+    assert metadata["decks"] == []
+    assert metadata["reservePlaytest"] is True
+    assert argv[1:3] == ["-m", "oracle_ai.training.world_model"]
+    assert argv[argv.index("--output") + 1] == str(run)
+    assert label == "Graph Pilot · V13 · world model"
+
+    world_checkpoint = run / "checkpoints" / "step-3" / "world-model.pt"
+    world_checkpoint.parent.mkdir(parents=True)
+    world_checkpoint.touch()
+    argv, label, _ = manager._existing_pool_training_command(model_id)  # noqa: SLF001
+    assert argv[1:3] == ["-m", "oracle_ai.training.rl_v13"]
+    assert label == "Graph Pilot · V13 · PPO self-play"
+
+    argv, label, _ = manager._existing_pool_training_command(  # noqa: SLF001
+        model_id, "world-model"
+    )
+    assert argv[1:3] == ["-m", "oracle_ai.training.world_model"]
+    assert label == "Graph Pilot · V13 · world model"
+
+    (run / "v13-engine-baseline.pt").touch()
+    argv, label, _ = manager._existing_pool_training_command(  # noqa: SLF001
+        model_id, "engine-evaluation"
+    )
+    assert argv[1:3] == ["-m", "oracle_ai.training.rl_v13"]
+    assert argv[-1] == "--evaluate-only"
+    assert label == "Graph Pilot · V13 · Engine evaluation"
 
 
 def test_dataset_must_exist(tmp_path: Path) -> None:
@@ -155,6 +340,34 @@ def test_playtest_uses_inline_decks_from_the_models_training_pool(tmp_path: Path
     assert setup["setup"]["players"][1]["name"] == "AI Pool Deck"
 
 
+def test_v13_playtest_uses_its_rl_checkpoint(tmp_path: Path) -> None:
+    checkpoint = local_checkpoint(tmp_path, architecture="v13")
+    (checkpoint / "manifest.json").unlink()
+    (checkpoint / "checkpoint.pt").unlink()
+    (checkpoint / "rl-model.pt").touch()
+    manager = JobManager(tmp_path)
+
+    argv, label, _ = manager._playtest_command(  # noqa: SLF001
+        {
+            "agent": "v13",
+            "model_id": "my-local-ai",
+            "checkpoint": str(checkpoint),
+            "engine_url": "http://127.0.0.1:8787",
+            "format": "legacy",
+            "deck_version_id": "pool-deck-1",
+            "opponent_deck_version_id": "pool-deck-2",
+        }
+    )
+
+    assert argv[argv.index("-m") + 1 : argv.index("--target")] == [
+        "deepdeck_examples.run",
+        "v13",
+    ]
+    assert argv[argv.index("--checkpoint") + 1] == str(checkpoint.resolve())
+    assert label.startswith("My Local AI ")
+    assert label.endswith(" local legacy")
+
+
 def test_playtest_uses_deck_added_after_the_last_training_resolution(tmp_path: Path) -> None:
     manager = JobManager(tmp_path)
     checkpoint = local_checkpoint(tmp_path)
@@ -179,6 +392,30 @@ def test_playtest_uses_deck_added_after_the_last_training_resolution(tmp_path: P
     setup_path = Path(argv[argv.index("--local-game-setup") + 1])
     setup = json.loads(setup_path.read_text(encoding="utf-8"))
     assert setup["setup"]["players"][0]["name"] == "AI Pool Deck"
+
+
+def test_playtest_generates_a_fresh_game_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = JobManager(tmp_path)
+    checkpoint = local_checkpoint(tmp_path)
+    monkeypatch.setattr(manager, "_random_seed", lambda: 31415926)
+
+    argv, _, _ = manager._playtest_command(  # noqa: SLF001
+        {
+            "agent": "v12",
+            "model_id": "my-local-ai",
+            "checkpoint": str(checkpoint),
+            "engine_url": "http://127.0.0.1:8787",
+            "format": "legacy",
+            "deck_version_id": "pool-deck-1",
+            "opponent_deck_version_id": "pool-deck-2",
+        }
+    )
+
+    setup_path = Path(argv[argv.index("--local-game-setup") + 1])
+    setup = json.loads(setup_path.read_text(encoding="utf-8"))
+    assert setup["seed"] == 31415926
 
 
 def test_playtest_recompiles_cached_card_rules_with_the_current_oracle(
@@ -425,6 +662,114 @@ def test_modal_double_faced_card_characteristics_are_refreshed_from_scryfall(
     assert len(oracle_request(witch)["faces"]) == 2
 
 
+def test_transform_planeswalker_face_keeps_starting_loyalty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def scryfall_collection(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "tamiyo",
+                        "layout": "transform",
+                        "card_faces": [
+                            {
+                                "name": "Tamiyo, Inquisitive Student",
+                                "type_line": "Legendary Creature - Moonfolk Wizard",
+                                "mana_cost": "{U}",
+                                "oracle_text": (
+                                    "When you draw your third card in a turn, transform Tamiyo."
+                                ),
+                                "power": "0",
+                                "toughness": "3",
+                            },
+                            {
+                                "name": "Tamiyo, Seasoned Scholar",
+                                "type_line": "Legendary Planeswalker - Tamiyo",
+                                "mana_cost": "",
+                                    "oracle_text": (
+                                        "+2: Until your next turn, attacking creatures get -1/-0."
+                                    ),
+                                "loyalty": "2",
+                            },
+                        ],
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("deepdeck_learner.card_models.httpx.post", scryfall_collection)
+    [tamiyo] = enrich_card_characteristics(
+        tmp_path,
+        [
+            {
+                "cardId": "tamiyo-card",
+                "scryfallId": "tamiyo",
+                "name": "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar",
+                "typeLine": (
+                    "Legendary Creature - Moonfolk Wizard // "
+                    "Legendary Planeswalker - Tamiyo"
+                ),
+                "imageBackUri": "https://example.test/tamiyo-back.jpg",
+            }
+        ],
+    )
+
+    assert tamiyo["faces"][1]["loyalty"] == "2"
+    assert oracle_request(tamiyo)["faces"][1]["loyalty"] == "2"
+
+
+def test_compiled_transform_faces_keep_planeswalker_loyalty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("deepdeck_learner.card_models.engine_signature", lambda _: None)
+
+    def oracle_rules(url: str, **kwargs: object) -> httpx.Response:
+        request = kwargs["json"]
+        assert isinstance(request, dict)
+        faces = request["faces"]
+        assert isinstance(faces, list)
+        compiled_faces = [
+            {key: value for key, value in face.items() if key != "loyalty"} for face in faces
+        ]
+        return httpx.Response(
+            200,
+            json={"rules": [{"kind": "rulesMarker", "transformFaces": compiled_faces}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("deepdeck_learner.card_models.httpx.post", oracle_rules)
+    cards = [
+        {
+            "id": "tamiyo",
+            "name": "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar",
+            "typeLine": "Legendary Creature // Legendary Planeswalker",
+            "layout": "transform",
+            "faces": [
+                {
+                    "id": "tamiyo-front",
+                    "name": "Tamiyo, Inquisitive Student",
+                    "typeLine": "Legendary Creature",
+                    "oracleText": "When you draw your third card, transform Tamiyo.",
+                },
+                {
+                    "id": "tamiyo-back",
+                    "name": "Tamiyo, Seasoned Scholar",
+                    "typeLine": "Legendary Planeswalker",
+                    "oracleText": "+2: Draw a card.",
+                    "loyalty": "2",
+                },
+            ],
+        }
+    ]
+
+    rules = compile_oracle_rules(tmp_path, "http://127.0.0.1:8787", cards)
+
+    assert rules["tamiyo"][0]["transformFaces"][1]["loyalty"] == "2"
+
+
 def test_playtest_resolves_player_random_deck_before_weighting_ai_deck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -605,7 +950,9 @@ def test_restart_keeps_a_playtest_visible_when_its_agent_process_is_alive() -> N
     assert reconciled["details"]["sessionId"] == "game-session:6"
 
 
-def test_pool_training_builds_local_catalog_and_parallel_config(tmp_path: Path) -> None:
+def test_pool_training_builds_local_catalog_and_parallel_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     version_id = "deck-version-1"
     pool_dir = tmp_path / ".deepdeck"
     deck_dir = pool_dir / "decks"
@@ -661,11 +1008,16 @@ def test_pool_training_builds_local_catalog_and_parallel_config(tmp_path: Path) 
         encoding="utf-8",
     )
     (config_dir / "league-v12-legacy.yaml").write_text(
-        "deckSource: database\noutputDir: old\nparallelGameWorkers: 1\n",
+        (
+            "seed: 1\ntrainingSeed: 2\ndeckSource: database\n"
+            "outputDir: old\nparallelGameWorkers: 1\nevaluation:\n  seed: 3\n"
+        ),
         encoding="utf-8",
     )
 
     manager = JobManager(tmp_path)
+    generated_seeds = iter((101, 202, 303))
+    monkeypatch.setattr(manager, "_random_seed", lambda: next(generated_seeds))
     argv, label, run = manager._training_command(  # noqa: SLF001
         "training.pool",
         {
@@ -685,6 +1037,9 @@ def test_pool_training_builds_local_catalog_and_parallel_config(tmp_path: Path) 
     assert config["rolloutBatchGames"] == 3
     assert config["maxCheckpoints"] == 2
     assert config["continuous"] is True
+    assert config["seed"] == 101
+    assert config["trainingSeed"] == 202
+    assert config["evaluation"]["seed"] == 303
     assert config["learnerSettings"]["reservePlaytest"] is True
     assert config["learnerSettings"]["modelName"] == "Test Pilot"
     assert "deckSource" not in config

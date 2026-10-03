@@ -58,11 +58,22 @@ def requires_power_toughness(card: dict[str, Any]) -> bool:
 
 def requires_face_characteristics(card: dict[str, Any]) -> bool:
     faces = card.get("faces")
+    faces_are_complete = (
+        isinstance(faces, list)
+        and len(faces) >= 2
+        and bool(card.get("layout"))
+        and all(
+            not isinstance(face, dict)
+            or "planeswalker" not in str(face.get("typeLine", "")).casefold()
+            or face.get("loyalty") is not None
+            for face in faces
+        )
+    )
     return (
         bool(card.get("imageBackUri"))
         or "//" in str(card.get("name", ""))
         or "//" in str(card.get("typeLine", ""))
-    ) and not (isinstance(faces, list) and len(faces) >= 2 and card.get("layout"))
+    ) and not faces_are_complete
 
 
 def enrich_card_characteristics(root: Path, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -90,6 +101,12 @@ def enrich_card_characteristics(root: Path, cards: list[dict[str, Any]]) -> list
             bool(cached.get("layout"))
             and isinstance(cached.get("faces"), list)
             and len(cached["faces"]) >= 2
+            and all(
+                not isinstance(face, dict)
+                or "planeswalker" not in str(face.get("typeLine", "")).casefold()
+                or face.get("loyalty") is not None
+                for face in cached["faces"]
+            )
         )
         if (
             scryfall_id
@@ -153,6 +170,7 @@ def enrich_card_characteristics(root: Path, cards: list[dict[str, Any]]) -> list
                         "typeLine": str(face.get("type_line", "")),
                         "manaCost": face.get("mana_cost"),
                         "oracleText": face.get("oracle_text"),
+                        "loyalty": face.get("loyalty"),
                         "power": face.get("power"),
                         "toughness": face.get("toughness"),
                     }
@@ -300,6 +318,27 @@ def compile_oracle_rules(
             encoding="utf-8",
         )
         pending.replace(cache_path)
+
+    cards_by_id = {
+        card_identifier(card): card
+        for card in cards
+        if card_identifier(card)
+    }
+    for card_id, rules in compiled.items():
+        faces = cards_by_id.get(card_id, {}).get("faces")
+        if not isinstance(faces, list):
+            continue
+        for rule in rules:
+            compiled_faces = rule.get("transformFaces") if isinstance(rule, dict) else None
+            if not isinstance(compiled_faces, list):
+                continue
+            for compiled_face, source_face in zip(compiled_faces, faces, strict=False):
+                if (
+                    isinstance(compiled_face, dict)
+                    and isinstance(source_face, dict)
+                    and source_face.get("loyalty") is not None
+                ):
+                    compiled_face["loyalty"] = str(source_face["loyalty"])
     return compiled
 
 

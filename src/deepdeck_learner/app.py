@@ -11,12 +11,16 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from oracle_ai.training.curriculum import curriculum_catalog
+
 from .catalogs import (
     CatalogAuthenticationError,
     CatalogError,
     CatalogNotFoundError,
     account_api_key,
     active_competitions,
+    cached_deck_download,
+    cached_decks,
     download_platform_deck,
     local_deck_presentation,
     local_legal_decks,
@@ -34,6 +38,19 @@ from .resources import (
 )
 from .settings import load_api_key, save_api_key
 from .status import capability_status, project_root
+from .training_platform import (
+    acquire_replay_lease,
+    list_saved_replays,
+    load_agent_training_contract,
+    load_saved_replay,
+    load_training_settings,
+    release_replay_lease,
+    renew_replay_lease,
+    save_agent_training_control,
+    save_replay_forever,
+    save_training_settings,
+    training_evidence,
+)
 
 
 def create_app(root: Path | None = None) -> FastAPI:
@@ -179,8 +196,139 @@ def create_app(root: Path | None = None) -> FastAPI:
         return {"items": deck_statistics(resolved_root)}
 
     @app.get("/api/v1/statistics/training")
-    def local_training_statistics() -> dict[str, Any]:
-        return {"items": training_statistics(resolved_root)}
+    def local_training_statistics(window: str = "200") -> dict[str, Any]:
+        try:
+            return {"items": training_statistics(resolved_root, window)}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/v1/training/curriculum")
+    def training_curriculum() -> dict[str, Any]:
+        return curriculum_catalog()
+
+    @app.get("/api/v1/models/{model_id}/training-settings")
+    def model_training_settings(model_id: str) -> dict[str, Any]:
+        try:
+            return load_training_settings(resolved_root, model_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.put("/api/v1/models/{model_id}/training-settings")
+    def update_model_training_settings(
+        model_id: str,
+        payload: dict[str, Any],
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(x_deepdeck_token)
+        if manager.model_has_active_workers(model_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Stop this agent before changing its training stages or cadence.",
+            )
+        try:
+            return save_training_settings(resolved_root, model_id, payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/v1/models/{model_id}/evidence")
+    def model_training_evidence(model_id: str) -> dict[str, Any]:
+        try:
+            return training_evidence(resolved_root, model_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get("/api/v1/models/{model_id}/training-contract")
+    def model_training_contract(model_id: str) -> dict[str, Any]:
+        try:
+            return load_agent_training_contract(resolved_root, model_id)
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.put("/api/v1/models/{model_id}/training-control")
+    def update_model_training_control(
+        model_id: str,
+        payload: dict[str, Any],
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(x_deepdeck_token)
+        try:
+            return save_agent_training_control(resolved_root, model_id, payload)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/v1/models/{model_id}/replays")
+    def model_replays(model_id: str) -> dict[str, Any]:
+        try:
+            return {"items": list_saved_replays(resolved_root, model_id)}
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get("/api/v1/models/{model_id}/replays/{replay_id}")
+    def model_replay(model_id: str, replay_id: str) -> dict[str, Any]:
+        try:
+            return load_saved_replay(resolved_root, model_id, replay_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/v1/models/{model_id}/replays/{replay_id}/leases")
+    def acquire_model_replay_lease(
+        model_id: str,
+        replay_id: str,
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(x_deepdeck_token)
+        try:
+            return acquire_replay_lease(resolved_root, model_id, replay_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.put("/api/v1/models/{model_id}/replays/{replay_id}/leases/{lease_id}")
+    def renew_model_replay_lease(
+        model_id: str,
+        replay_id: str,
+        lease_id: str,
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, int]:
+        authorize(x_deepdeck_token)
+        try:
+            return renew_replay_lease(resolved_root, model_id, replay_id, lease_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/v1/models/{model_id}/replays/{replay_id}/leases/{lease_id}")
+    def release_model_replay_lease(
+        model_id: str,
+        replay_id: str,
+        lease_id: str,
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, bool]:
+        authorize(x_deepdeck_token)
+        try:
+            return release_replay_lease(resolved_root, model_id, replay_id, lease_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/v1/models/{model_id}/replays/{replay_id}/save")
+    def permanently_save_model_replay(
+        model_id: str,
+        replay_id: str,
+        x_deepdeck_token: str | None = Header(default=None),
+    ) -> dict[str, bool]:
+        authorize(x_deepdeck_token)
+        try:
+            return save_replay_forever(resolved_root, model_id, replay_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/v1/games")
     def active_local_games() -> dict[str, Any]:
@@ -205,6 +353,9 @@ def create_app(root: Path | None = None) -> FastAPI:
             account_api_key()
             return platform_decks(search, format, max(1, page))
         except CatalogAuthenticationError as error:
+            local = cached_decks(resolved_root, search, format, max(1, page))
+            if local["items"]:
+                return local
             raise HTTPException(status_code=401, detail=str(error)) from error
         except CatalogError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
@@ -214,6 +365,9 @@ def create_app(root: Path | None = None) -> FastAPI:
         version_id: str, x_deepdeck_token: str | None = Header(default=None)
     ) -> dict[str, Any]:
         authorize(x_deepdeck_token)
+        local = cached_deck_download(resolved_root, version_id)
+        if local is not None:
+            return local
         try:
             return download_platform_deck(resolved_root, version_id)
         except CatalogAuthenticationError as error:
@@ -343,7 +497,10 @@ def create_app(root: Path | None = None) -> FastAPI:
                 status_code=503,
                 detail="Frontend is not built. Run npm run build in apps/learner-web.",
             )
-        return FileResponse(index)
+        return FileResponse(
+            index,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     return app
 

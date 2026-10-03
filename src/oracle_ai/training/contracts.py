@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+from deepdeck_agent import (
+    TrainingContract,
+    TrainingMetric,
+    TrainingParameter,
+    TrainingPhase,
+)
+
+
+def v13_training_contract(agent_id: str, display_name: str) -> TrainingContract:
+    """Describe V13 without teaching DeepDeckLearner any V13-specific UI rules."""
+
+    world_metrics = (
+        TrainingMetric(
+            "reconstruction_loss",
+            "Reconstruction loss",
+            "loss",
+            "minimize",
+            description="Error rebuilding the observed game graph from the latent state.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "dynamics_loss",
+            "Dynamics loss",
+            "loss",
+            "minimize",
+            description="Error predicting the next latent state after an action.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "kl_loss",
+            "KL loss",
+            "loss",
+            "target",
+            description="Regularization between the learned prior and posterior beliefs.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "belief_loss",
+            "Belief loss",
+            "loss",
+            "minimize",
+            description="Error in hidden-information belief prediction.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "opponent_loss",
+            "Opponent loss",
+            "loss",
+            "minimize",
+            description="Error modeling the opponent's likely behavior.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "search_loss",
+            "Search loss",
+            "loss",
+            "minimize",
+            description="Mismatch between policy logits and search-improved targets.",
+            group="world-model",
+        ),
+        TrainingMetric(
+            "value_loss",
+            "Value loss",
+            "loss",
+            "minimize",
+            description="Error predicting the eventual game result.",
+            group="world-model",
+        ),
+    )
+    rl_metrics = (
+        TrainingMetric(
+            "loss",
+            "PPO total loss",
+            "loss",
+            "minimize",
+            description="Combined clipped-policy, value, and entropy objective.",
+            group="reinforcement-learning",
+        ),
+        TrainingMetric(
+            "policy_loss",
+            "Policy loss",
+            "loss",
+            "target",
+            description="Clipped PPO policy objective; trend and stability matter more than zero.",
+            group="reinforcement-learning",
+        ),
+        TrainingMetric(
+            "value_loss",
+            "Value loss",
+            "loss",
+            "minimize",
+            description="Error predicting returns from authoritative Engine games.",
+            group="reinforcement-learning",
+        ),
+        TrainingMetric(
+            "entropy",
+            "Policy entropy",
+            "scalar",
+            "target",
+            description="Action diversity; collapse toward zero can stop exploration.",
+            group="reinforcement-learning",
+        ),
+        TrainingMetric(
+            "approx_kl",
+            "Approximate KL",
+            "scalar",
+            "target",
+            description="Policy movement per update, compared with the configured KL safety target.",
+            group="reinforcement-learning",
+        ),
+        TrainingMetric(
+            "episode_reward",
+            "Episode reward",
+            "reward",
+            "maximize",
+            description="Seat-one reward over completed Legacy self-play matches.",
+            group="gameplay",
+        ),
+    )
+    evaluation_metrics = (
+        TrainingMetric(
+            "win_rate",
+            "Fixed-seed win rate",
+            "rate",
+            "maximize",
+            unit="ratio",
+            description="Candidate record against the frozen pre-Engine baseline.",
+            group="evidence",
+        ),
+        TrainingMetric(
+            "lower_95",
+            "95% confidence lower bound",
+            "rate",
+            "maximize",
+            unit="ratio",
+            description="Wilson lower confidence bound used to avoid promotion on noise.",
+            group="evidence",
+        ),
+        TrainingMetric(
+            "curriculum_success_rate",
+            "Curriculum success rate",
+            "rate",
+            "maximize",
+            unit="ratio",
+            description="Share of fixed-seed focused scenarios completed successfully.",
+            group="curriculum",
+        ),
+        TrainingMetric(
+            "curriculum_mastery",
+            "Curriculum mastery",
+            "rate",
+            "maximize",
+            unit="ratio",
+            description="Mean objective-milestone completion across focused scenarios.",
+            group="curriculum",
+        ),
+    )
+    return TrainingContract(
+        agent_id=agent_id,
+        display_name=display_name,
+        phases=(
+            TrainingPhase(
+                "world-model",
+                "World model",
+                "Learn graph reconstruction, dynamics, beliefs, search, and value.",
+                metrics=world_metrics,
+                parameters=(
+                    TrainingParameter(
+                        "training.steps",
+                        "World-model steps",
+                        "integer",
+                        25_000,
+                        minimum=0,
+                        maximum=10_000_000,
+                    ),
+                ),
+            ),
+            TrainingPhase(
+                "reinforcement-learning",
+                "Legacy Engine self-play",
+                "Improve the policy from complete matches played on the rules Engine.",
+                metrics=rl_metrics,
+                parameters=(
+                    TrainingParameter(
+                        "rl.episodes",
+                        "Target matches",
+                        "integer",
+                        10_000,
+                        minimum=1,
+                        maximum=10_000_000,
+                    ),
+                    TrainingParameter(
+                        "rl.rollout_episodes",
+                        "Matches per PPO update",
+                        "integer",
+                        2,
+                        minimum=1,
+                        maximum=256,
+                        apply="next-phase",
+                    ),
+                    TrainingParameter(
+                        "savedGameLimit",
+                        "Temporary replay limit",
+                        "integer",
+                        20,
+                        minimum=0,
+                        maximum=500,
+                        apply="live",
+                    ),
+                ),
+                controls=("start", "pause", "resume", "stop", "checkpoint"),
+            ),
+            TrainingPhase(
+                "engine-evaluation",
+                "Controlled Engine evaluation",
+                "Paired, fixed-seed games against a frozen baseline.",
+                metrics=evaluation_metrics,
+                parameters=(
+                    TrainingParameter(
+                        "rl.evaluation_every_updates",
+                        "Evaluate every PPO updates",
+                        "integer",
+                        10,
+                        minimum=1,
+                        maximum=100_000,
+                    ),
+                    TrainingParameter(
+                        "rl.evaluation_games",
+                        "Paired evaluation games",
+                        "integer",
+                        2,
+                        minimum=2,
+                        maximum=1_000,
+                    ),
+                ),
+                controls=("evaluate",),
+            ),
+        ),
+    )

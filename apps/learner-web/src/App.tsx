@@ -25,11 +25,22 @@ import {
   loadResources,
   loadStatus,
   loadTrainingStatistics,
+  loadTrainingEvidence,
+  loadTrainingSettings,
+  loadTrainingCurriculum,
+  loadAgentTrainingContract,
+  loadSavedReplays,
+  acquireSavedReplay,
+  releaseSavedReplayLease,
+  renewSavedReplayLease,
+  saveReplayForever,
   downloadDeck,
   loadTrainingDeckPool,
   saveApiKey,
   saveModelResources,
   saveTrainingDeckPool,
+  saveTrainingSettings,
+  saveAgentTrainingControl,
   searchDecks,
   startJob,
   stopGame,
@@ -45,10 +56,18 @@ import {
   type ResourcePlan,
   type ResourceSnapshot,
   type TrainingStatistic,
+  type TrainingEvidence,
+  type TrainingSettings,
+  type TrainingCurriculum,
+  type SavedReplay,
+  type SavedReplaySummary,
+  type AgentTrainingPublication,
 } from "./api";
 import { workflowBlockers, type Workflow } from "./readiness";
+import AsyncActionButton from "./AsyncActionButton";
 
 const LocalPixiTable = lazy(() => import("./LocalPixiTable"));
+const LocalPixiReplay = lazy(() => import("./LocalPixiReplay"));
 
 class PixiErrorBoundary extends Component<
   { children: ReactNode; onClose: () => void },
@@ -290,7 +309,7 @@ function AccountSetup({ status, account, refresh }: { status: CapabilityStatus |
             Deep Deck League API key
             <input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="ddl_agent_…" />
           </label>
-          <button className="primary" type="submit" disabled={busy || apiKey.trim().length < 24}>{busy ? "Saving…" : "Save API key"}</button>
+          <AsyncActionButton className="primary" type="submit" loading={busy} loadingLabel="Saving API key…" disabled={apiKey.trim().length < 24}>Save API key</AsyncActionButton>
           {account.valid === true && <button type="button" onClick={() => { setReplacing(false); setApiKey(""); }}>Cancel</button>}
         </form>
       )}
@@ -513,10 +532,12 @@ function DependencyPanel({
             is needed, and starts Engine.
           </p>
         </div>
-        <button
+        <AsyncActionButton
           className="primary"
           type="button"
-          disabled={!status || Boolean(busy) || Boolean(activeDependencyJob) || dirty}
+          loading={Boolean(busy) || Boolean(activeDependencyJob)}
+          loadingLabel={stackReady ? "Verifying local stack…" : "Setting up local stack…"}
+          disabled={!status || dirty}
           onClick={() => void startStack()}
         >
           {stackReady
@@ -526,7 +547,7 @@ function DependencyPanel({
             : stackJob || busy === "stack"
               ? "Setting up…"
               : "Set up Engine + Pixi"}
-        </button>
+        </AsyncActionButton>
       </div>
       {activeKind && (
         <DependencyLoader
@@ -1064,7 +1085,7 @@ function LocalTrainingForm({ status, account, refresh }: { status: CapabilitySta
   const [starting, setStarting] = useState(false);
   const [created, setCreated] = useState(false);
   const [error, setError] = useState("");
-  const requiredFormat = model === "v12" ? "legacy" : "commander";
+  const requiredFormat = model === "v11" ? "commander" : "legacy";
   const compatibleDeckCount = selected.filter(
     (deck) => deck.format?.toLowerCase() === requiredFormat,
   ).length;
@@ -1132,7 +1153,8 @@ function LocalTrainingForm({ status, account, refresh }: { status: CapabilitySta
 
   return <section className="panel configure local-training-form">
     <div className="section-heading"><div><span className="eyebrow">New agent</span><h2>Architecture and training decks</h2><p className="section-lead">Create the agent identity here. CPU, GPU and simultaneous games are assigned later from Jobs.</p></div><span className="step">CONFIG</span></div>
-    {account?.valid !== true && <div className="notice warning"><strong>{account?.configured ? "Replace the rejected API key" : "API key required"}</strong><span>{selected.length > 0 ? "Your downloaded deck snapshots remain available locally. A valid key is only required to add more decks or join the League." : account?.reason ?? "Configure your Deep Deck League API key to access training decks."}</span></div>}
+    {account?.valid !== true && <div className="notice warning"><strong>{account?.valid === false && account.configured ? "Replace the rejected API key" : account?.configured ? "League platform unavailable" : "API key required"}</strong><span>{model === "v13" ? "V13 world-model pretraining is local and does not require a League API key." : selected.length > 0 ? "Your downloaded deck snapshots remain available locally. A valid key is only required to add more decks or join the League." : account?.reason ?? "Configure your Deep Deck League API key to access training decks."}</span></div>}
+    <label>Architecture<select value={model} onChange={(event) => setModel(event.target.value)}><option value="v13">V13 · graph-belief experimental</option><option value="v12" disabled={!selected.some((deck) => deck.format?.toLowerCase() === "legacy")}>V12 · Legacy</option><option value="v11" disabled={!selected.some((deck) => deck.format?.toLowerCase() === "commander")}>V11 · Commander</option></select><small>{model === "v13" ? "Local world-model pretraining; no API key, deck, or Engine session required." : `${compatibleDeckCount} ${requiredFormat} deck${compatibleDeckCount === 1 ? "" : "s"} available for this model.`}</small></label>
     <>
       <div className="training-pool-heading"><div><strong>Training deck pool</strong><small>{selected.length === 0 ? "No deck selected" : `${selected.length} deck${selected.length === 1 ? "" : "s"} ready locally`}</small></div></div>
       {selected.length > 0 && <div className="selected-training-pool">{selected.map((deck) => <button type="button" key={deck.id} onClick={() => void toggleDeck(deck)} title="Remove from training pool"><span><strong>{deck.name}</strong><small>{deck.format ?? "Deck"} · v{deck.version}</small></span><b aria-hidden="true">×</b></button>)}</div>}
@@ -1143,16 +1165,15 @@ function LocalTrainingForm({ status, account, refresh }: { status: CapabilitySta
       {busy && <p className="deck-pool-empty" role="status">Adding the deck to the local pool…</p>}
       {selected.length > 0 && <div className="notice success" role="status"><strong>Training pool ready locally</strong><span>{selected.length} immutable deck snapshot{selected.length === 1 ? "" : "s"} stored in .deepdeck/decks.</span></div>}
       {error && <p className="form-error" role="alert">{error}</p>}
-      {selected.length > 0 && <div className="training-launch">
-        <label>Model name<input value={modelName} maxLength={64} onChange={(event) => setModelName(event.target.value)} placeholder="Example: Montréal Control" /><small>This is your AI's name. V11 or V12 is only its starting architecture.</small></label>
-        <label>Model<select value={model} onChange={(event) => setModel(event.target.value)}><option value="v12" disabled={!selected.some((deck) => deck.format?.toLowerCase() === "legacy")}>V12 · Legacy</option><option value="v11" disabled={!selected.some((deck) => deck.format?.toLowerCase() === "commander")}>V11 · Commander</option></select><small>{compatibleDeckCount} {requiredFormat} deck{compatibleDeckCount === 1 ? "" : "s"} available for this model.</small></label>
-        <div className="model-implementation"><strong>{model === "v12" ? "V12 · structured two-player policy" : "V11 · structured multiplayer policy"}</strong><p>{model === "v12" ? "Designed for two-player Legacy: structured observations, legal-action encoding, two relative value slots, self-play collection and PPO updates." : "Designed for Commander: structured observations, legal-action encoding, four multiplayer value slots, shared-policy self-play and PPO updates."}</p><small>Deep Deck provides the architecture and training implementation. The generated weights, name and local model belong to this workspace.</small></div>
-        <div className="agent-mode-grid">
+      {(selected.length > 0 || model === "v13") && <div className="training-launch">
+        <label>Model name<input value={modelName} maxLength={64} onChange={(event) => setModelName(event.target.value)} placeholder="Example: Montréal Control" /><small>This is your AI's name; its architecture remains fixed after creation.</small></label>
+        <div className="model-implementation"><strong>{model === "v13" ? "V13 · graph-belief world model" : model === "v12" ? "V12 · structured two-player policy" : "V11 · structured multiplayer policy"}</strong><p>{model === "v13" ? "Experimental local pretraining with typed graph observations, recurrent latent dynamics, explicit belief and opponent heads, and separate loss telemetry. This first stage is not playable yet." : model === "v12" ? "Designed for two-player Legacy: structured observations, legal-action encoding, two relative value slots, self-play collection and PPO updates." : "Designed for Commander: structured observations, legal-action encoding, four multiplayer value slots, shared-policy self-play and PPO updates."}</p><small>Deep Deck provides the architecture and training implementation. The generated weights, name and local model belong to this workspace.</small></div>
+        {model !== "v13" && <div className="agent-mode-grid">
           <label className="check-setting"><input type="checkbox" checked={selfPlayAllSeats} onChange={(event) => setSelfPlayAllSeats(event.target.checked)} /><span><strong>Shared-model self-play</strong><small>{selfPlayAllSeats ? "The same model controls every player in each training game." : "Half of training games use the built-in anchor opponent."}</small></span></label>
           <label className="check-setting"><input type="checkbox" checked={reservePlaytest} onChange={(event) => setReservePlaytest(event.target.checked)} /><span><strong>Publish playable weights</strong><small>Keeps a stable checkpoint available while newer weights train.</small></span></label>
-        </div>
+        </div>}
         {created && <div className="notice success" role="status"><strong>Agent configured</strong><span>Open Jobs to assign simultaneous games and start training.</span></div>}
-        <div className="form-actions"><button className="primary" type="button" onClick={() => void configureAgent()} disabled={starting || created || modelName.trim().length < 2 || compatibleDeckCount === 0 || !status?.torch.ready || !status?.engine.healthy}>{starting ? "Preparing agent…" : created ? "Agent configured" : `Create ${modelName.trim() || model.toUpperCase()}`}</button><small>{modelName.trim().length < 2 ? "Give your model a name first." : compatibleDeckCount === 0 ? `Add a ${requiredFormat} deck for this agent.` : "No training starts until you explicitly start it in Jobs."}</small></div>
+        <div className="form-actions"><AsyncActionButton className="primary" type="button" onClick={() => void configureAgent()} loading={starting} loadingLabel="Preparing agent…" disabled={created || modelName.trim().length < 2 || (model !== "v13" && compatibleDeckCount === 0) || !status?.torch.ready || (model !== "v13" && !status?.engine.healthy)}>{created ? "Agent configured" : `Create ${modelName.trim() || model.toUpperCase()}`}</AsyncActionButton><small>{modelName.trim().length < 2 ? "Give your model a name first." : model !== "v13" && compatibleDeckCount === 0 ? `Add a ${requiredFormat} deck for this agent.` : "No training starts until you explicitly start it in Jobs."}</small></div>
       </div>}
     </>
   </section>;
@@ -1262,9 +1283,9 @@ function AgentEditor({ model, activeWorkers, onClose, refresh }: {
       <label className="check-setting"><input type="checkbox" checked={selfPlayAllSeats} onChange={(event) => setSelfPlayAllSeats(event.target.checked)} /><span><strong>Shared-model self-play</strong><small>The same model controls every training seat.</small></span></label>
       <label className="check-setting"><input type="checkbox" checked={reservePlaytest} onChange={(event) => setReservePlaytest(event.target.checked)} /><span><strong>Publish playable weights</strong><small>Keep a stable checkpoint available for playtests.</small></span></label>
     </div>
-    {activeWorkers.length > 0 && <div className="notice warning" role="status"><strong>{activeWorkers.length} active service{activeWorkers.length === 1 ? "" : "s"} must stop before saving</strong><span>Your edits stay in this form. Stop the agent's services, then save the changes.</span><button className="danger subtle" type="button" disabled={stopping} onClick={() => void stopActiveWorkers()}>{stopping ? "Stopping services…" : `Stop ${activeWorkers.length} active service${activeWorkers.length === 1 ? "" : "s"}`}</button></div>}
+    {activeWorkers.length > 0 && <div className="notice warning" role="status"><strong>{activeWorkers.length} active service{activeWorkers.length === 1 ? "" : "s"} must stop before saving</strong><span>Your edits stay in this form. Stop the agent's services, then save the changes.</span><AsyncActionButton className="danger subtle" type="button" loading={stopping} loadingLabel="Stopping services…" onClick={() => void stopActiveWorkers()}>{`Stop ${activeWorkers.length} active service${activeWorkers.length === 1 ? "" : "s"}`}</AsyncActionButton></div>}
     {error && <p className="form-error" role="alert">{error}</p>}
-    <div className="form-actions"><button type="button" onClick={onClose}>Cancel</button><button className="primary" type="button" disabled={saving || activeWorkers.length > 0 || name.trim().length < 2 || decks.length === 0} onClick={() => void save()}>{saving ? "Saving agent…" : "Save agent"}</button><small>{activeWorkers.length > 0 ? "Stop the active services above to enable saving." : "The existing weights are preserved when these settings change."}</small></div>
+    <div className="form-actions"><button type="button" onClick={onClose}>Cancel</button><AsyncActionButton className="primary" type="button" loading={saving} loadingLabel="Saving agent…" disabled={activeWorkers.length > 0 || name.trim().length < 2 || decks.length === 0} onClick={() => void save()}>Save agent</AsyncActionButton><small>{activeWorkers.length > 0 ? "Stop the active services above to enable saving." : "The existing weights are preserved when these settings change."}</small></div>
   </div>;
 }
 
@@ -1326,7 +1347,7 @@ function AgentCatalog({
           <strong>Delete {formatBytes(model.diskBytes)} permanently?</strong>
           <p>The agent, checkpoints, training history and local statistics in this run will be removed.</p>
           {activeWorkers.length > 0 ? <small>Stop its active jobs first.</small> : <label>Type <b>{model.name}</b><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label>}
-          <div><button type="button" onClick={() => { setConfirming(""); setConfirmation(""); }}>Keep agent</button><button className="danger" type="button" disabled={activeWorkers.length > 0 || confirmation !== model.name || deleting === model.id} onClick={() => void remove(model)}>{deleting === model.id ? "Deleting…" : "Delete files"}</button></div>
+          <div><button type="button" onClick={() => { setConfirming(""); setConfirmation(""); }}>Keep agent</button><AsyncActionButton className="danger" type="button" loading={deleting === model.id} loadingLabel="Deleting files…" disabled={activeWorkers.length > 0 || confirmation !== model.name} onClick={() => void remove(model)}>Delete files</AsyncActionButton></div>
         </div>}
       </article>;
     })}
@@ -1364,18 +1385,43 @@ function AgentAllocationRow({
   const [saving, setSaving] = useState(false);
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState("");
+  const [messageTone, setMessageTone] = useState<"progress" | "success" | "error">("success");
   const workers = resources?.workers.filter((worker) => worker.modelId === model.id) ?? [];
   const trainingWorker = workers.find((worker) => worker.kind === "training.pool");
   const trainingJob = jobs.find((job) => job.model_id === model.id && job.kind === "training.pool" && ["queued", "running"].includes(job.status));
+  const latestTrainingJob = jobs.find((job) => job.model_id === model.id && job.kind === "training.pool");
+  const latestTrainingLog = latestTrainingJob?.logs.filter((line) => line.trim()).at(-1);
   const trainingActive = Boolean(trainingWorker || trainingJob);
 
   useEffect(() => {
     let active = true;
     void loadModelResources(model.id)
       .then((value) => { if (active) { setPlan(value); setSavedPlan(value); } })
-      .catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : "Unable to load resources."); });
+      .catch((reason) => { if (active) { setMessageTone("error"); setMessage(reason instanceof Error ? reason.message : "Unable to load resources."); } });
     return () => { active = false; };
   }, [model.id]);
+
+  useEffect(() => {
+    if (!latestTrainingJob) return;
+    if (latestTrainingJob.status === "failed") {
+      setMessageTone("error");
+      setMessage(`Self-play failed: ${latestTrainingLog || `trainer exited with code ${latestTrainingJob.exit_code ?? "unknown"}`}`);
+    } else if (latestTrainingJob.status === "queued") {
+      setMessageTone("progress");
+      setMessage("Self-play is queued. Preparing the trainer configuration and worker processâ€¦");
+    } else if (latestTrainingJob.status === "running") {
+      setMessageTone(trainingWorker ? "success" : "progress");
+      setMessage(trainingWorker
+        ? `Self-play is running with ${trainingWorker.workerSlots} worker${trainingWorker.workerSlots === 1 ? "" : "s"}.${latestTrainingLog ? ` ${latestTrainingLog}` : ""}`
+        : `Trainer process started. Waiting for the first Engine gameâ€¦${latestTrainingLog ? ` ${latestTrainingLog}` : ""}`);
+    } else if (latestTrainingJob.status === "completed") {
+      setMessageTone("success");
+      setMessage("Self-play completed successfully. The latest weights and metrics were saved.");
+    } else if (latestTrainingJob.status === "stopped") {
+      setMessageTone("success");
+      setMessage("Self-play is stopped. The agent and its saved weights are preserved.");
+    }
+  }, [latestTrainingJob, latestTrainingLog, trainingWorker]);
 
   function update(key: keyof ResourcePlan, value: number) {
     setPlan((current) => current ? { ...current, [key]: value } : current);
@@ -1384,14 +1430,17 @@ function AgentAllocationRow({
   async function save() {
     if (!plan) return;
     setSaving(true);
-    setMessage("");
+    setMessageTone("progress");
+    setMessage("Saving the resource allocationâ€¦");
     try {
       const saved = await saveModelResources(model.id, plan);
       setPlan(saved);
       setSavedPlan(saved);
+      setMessageTone("success");
       setMessage(trainingActive ? "Allocation saved · trainer updates after the current batch." : "Allocation saved · ready to start.");
       refresh();
     } catch (reason) {
+      setMessageTone("error");
       setMessage(reason instanceof Error ? reason.message : "Unable to save resources.");
     } finally {
       setSaving(false);
@@ -1401,18 +1450,22 @@ function AgentAllocationRow({
   async function toggleTraining() {
     if (!plan) return;
     setWorking(true);
-    setMessage("");
+    setMessageTone("progress");
+    setMessage(trainingActive ? "Requesting a safe stop after the current training boundaryâ€¦" : "Starting self-playâ€¦ Preparing configuration, checkpoint and Engine workers.");
     try {
       if (trainingActive) {
         const jobId = trainingJob?.id ?? trainingWorker?.jobId;
         if (jobId) await stopJob(jobId);
+        setMessageTone("success");
         setMessage("Training stopped. The agent and its weights are preserved.");
       } else {
         await startJob({ kind: "training.pool", model_id: model.id });
-        setMessage("Training is starting. Live games will appear below.");
+        setMessageTone("progress");
+        setMessage("Self-play request accepted. Waiting for the trainer process and first Engine gameâ€¦");
       }
       refresh();
     } catch (reason) {
+      setMessageTone("error");
       setMessage(reason instanceof Error ? reason.message : "Unable to update training.");
     } finally {
       setWorking(false);
@@ -1476,11 +1529,11 @@ function AgentAllocationRow({
         </>
       )}
       <td className="agent-allocation-save">
-        <button className="secondary" type="button" disabled={saving || !plan || JSON.stringify(plan) === JSON.stringify(savedPlan)} onClick={() => void save()}>
+        <AsyncActionButton className="secondary" type="button" loading={saving} loadingLabel="Saving allocation…" disabled={!plan || JSON.stringify(plan) === JSON.stringify(savedPlan)} onClick={() => void save()}>
           {saving ? "Saving…" : JSON.stringify(plan) === JSON.stringify(savedPlan) ? "Allocation saved" : "Save allocation"}
-        </button>
-        <button className={trainingActive ? "danger" : "primary"} type="button" disabled={working || !plan || (!trainingActive && plan.trainingMatches < 1)} onClick={() => void toggleTraining()}>{working ? "Working…" : trainingActive ? "Stop training" : "Start training"}</button>
-        {message && <small role="status">{message}</small>}
+        </AsyncActionButton>
+        <AsyncActionButton className={trainingActive ? "danger" : "primary"} type="button" loading={working} loadingLabel={trainingActive ? "Stopping safely…" : "Starting training…"} disabled={!plan || (!trainingActive && plan.trainingMatches < 1)} onClick={() => void toggleTraining()}>{trainingActive ? "Stop training" : "Start training"}</AsyncActionButton>
+        {message && <div className={`training-operation-status ${messageTone}`} role={messageTone === "error" ? "alert" : "status"} aria-live="polite">{messageTone === "progress" && <span className="inline-spinner" aria-hidden="true" />}<span>{message}</span></div>}
       </td>
     </tr>
   );
@@ -1716,7 +1769,7 @@ function LeagueConnectionsPanel({
             </div>
             {loading ? <small>Loading valid {model.format} decks…</small> : mode === "single" ? <select aria-label={`Deck for ${model.name}`} value={singleDecks[model.id] ?? availableDecks[0]?.id ?? ""} onChange={(event) => setSingleDecks((current) => ({ ...current, [model.id]: event.target.value }))}>{availableDecks.map((deck) => <option value={deck.id} key={deck.id}>{deck.name}</option>)}</select> : mode === "pool" ? <div className="league-deck-pool">{availableDecks.map((deck) => <label key={deck.id}><input type="checkbox" checked={pool.includes(deck.id)} onChange={() => togglePoolDeck(model.id, deck.id)} /><span>{deck.name}</span></label>)}</div> : <small>{availableDecks.length} valid {model.format} deck{availableDecks.length === 1 ? "" : "s"} will be offered to the League for server-side selection at every match.</small>}
           </div>
-          <button className="secondary" type="button" disabled={working === model.id || loading || !competition || availableDecks.length === 0 || (mode === "pool" && pool.length === 0)} onClick={() => void connect(model)}>{working === model.id ? "Connecting…" : "Connect allocated slots"}</button>
+          <AsyncActionButton className="secondary" type="button" loading={working === model.id} loadingLabel="Connecting allocated slots…" disabled={loading || !competition || availableDecks.length === 0 || (mode === "pool" && pool.length === 0)} onClick={() => void connect(model)}>Connect allocated slots</AsyncActionButton>
           {messages[model.id] && <small role="status">{messages[model.id]}</small>}
         </article>;
       })}
@@ -1759,7 +1812,7 @@ function ActiveGamesPanel({ games, refresh, onOpen }: { games: ActiveGame[]; ref
         <p>{game.decks.filter(Boolean).join(" vs ") || "Preparing matchup"}</p>
         <div className="game-progress"><span>Round <b>{game.roundNumber ?? "—"}</b></span><span>Turn <b>{game.turnNumber ?? "—"}</b></span><span>Decisions <b>{game.decisions}</b></span><span>Players <b>{game.players}</b></span></div>
         {game.playersState.length > 0 && <div className="game-player-strip">{game.playersState.map((player, index) => <span className={player.hasLost ? "lost" : ""} key={player.id ?? index}><b>{player.life ?? "—"}</b><small>{player.name ?? `P${index + 1}`} · {player.handCount ?? 0} cards</small></span>)}</div>}
-        <footer><small>{game.mode ?? game.status}{game.sessionId ? ` · ${game.sessionId}` : " · session opening"}</small><div className="live-game-actions">{game.source === "local" && game.jobId && <button type="button" onClick={() => onOpen(game)}>Open game</button>}{game.source === "league" && game.watchUrl && <a className="button-link" href={game.watchUrl} target="_blank" rel="noreferrer">Watch League</a>}{game.source !== "league" && <button className="danger" type="button" disabled={!game.canCancel || stopping === game.id} onClick={() => void cancel(game)}>{stopping === game.id ? "Cancelling…" : game.canCancel ? "Cancel game" : "Opening…"}</button>}</div></footer>
+        <footer><small>{game.mode ?? game.status}{game.sessionId ? ` · ${game.sessionId}` : " · session opening"}</small><div className="live-game-actions">{game.source === "local" && game.jobId && <button type="button" onClick={() => onOpen(game)}>Open game</button>}{game.source === "league" && game.watchUrl && <a className="button-link" href={game.watchUrl} target="_blank" rel="noreferrer">Watch League</a>}{game.source !== "league" && <AsyncActionButton className="danger" type="button" loading={stopping === game.id} loadingLabel="Cancelling game…" disabled={!game.canCancel} onClick={() => void cancel(game)}>{game.canCancel ? "Cancel game" : "Opening…"}</AsyncActionButton>}</div></footer>
       </article>)}
     </div>}
     {error && <p className="form-error" role="alert">{error}</p>}
@@ -1816,25 +1869,479 @@ function trainingMetrics(job: Job) {
   return null;
 }
 
-function StatisticsPage({ jobs, decks, training }: { jobs: Job[]; decks: DeckStatistic[]; training: TrainingStatistic[] }) {
+const lossInformation: Record<string, string> = {
+  loss: "Weighted total objective optimized by the trainer. Lower is generally better, but compare it only within the same training phase and configuration.",
+  policy_loss: "Clipped PPO policy objective. Its sign may change and a value near zero is normal; interpret it together with reward, entropy and KL.",
+  value_loss: "Error between the predicted value and the observed return or outcome. Lower means the critic estimates results more accurately.",
+  reconstruction_loss: "Error when reconstructing visible graph features. Lower means the encoder retains more information from the observation.",
+  dynamics_loss: "Error between the predicted next latent state and the encoded next state. Lower means action-conditioned transitions are modeled more accurately.",
+  kl_loss: "Divergence between posterior and prior latent distributions. Large values indicate mismatch; values pinned near zero can indicate posterior collapse.",
+  belief_loss: "Binary cross-entropy for hidden-state beliefs. Lower is better, but calibration and the class-frequency baseline also matter.",
+  opponent_loss: "Cross-entropy for predicting the opponent's action. Compare it with the random baseline log(number of action classes).",
+  search_loss: "Cross-entropy against the search-policy target. Lower means the policy follows search more closely; a plateau may reflect noisy or impossible targets.",
+};
+
+function lossHelp(name: string): string {
+  return lossInformation[name]
+    ?? "Optimization error for this objective. Lower is usually better; interpret its scale against the same objective and training phase.";
+}
+
+type DeckSortKey = "deck" | "rank" | "ordinal" | "mu" | "matches" | "record" | "winRate";
+type DeckSortDirection = "asc" | "desc";
+
+const initialDeckSort: { key: DeckSortKey; direction: DeckSortDirection } = {
+  key: "ordinal",
+  direction: "desc",
+};
+
+function deckSortValue(deck: DeckStatistic, key: DeckSortKey): string | number | null {
+  switch (key) {
+    case "deck": return `${deck.modelName}\u0000${deck.deckName}`;
+    case "rank": return deck.rank;
+    case "ordinal": return deck.ordinal;
+    case "mu": return deck.mu;
+    case "matches": return deck.matches;
+    case "record": return deck.gameWins - deck.gameLosses;
+    case "winRate": return deck.winRate;
+  }
+}
+
+function compareDeckStatistics(
+  left: DeckStatistic,
+  right: DeckStatistic,
+  key: DeckSortKey,
+  direction: DeckSortDirection,
+): number {
+  const leftValue = deckSortValue(left, key);
+  const rightValue = deckSortValue(right, key);
+  if (leftValue === null && rightValue !== null) return 1;
+  if (leftValue !== null && rightValue === null) return -1;
+  let comparison = 0;
+  if (typeof leftValue === "string" && typeof rightValue === "string") {
+    comparison = leftValue.localeCompare(rightValue, undefined, { sensitivity: "base" });
+  } else if (typeof leftValue === "number" && typeof rightValue === "number") {
+    comparison = leftValue - rightValue;
+  }
+  if (comparison !== 0) return direction === "asc" ? comparison : -comparison;
+  if (key === "mu" && left.sigma !== right.sigma) return left.sigma - right.sigma;
+  return left.deckName.localeCompare(right.deckName, undefined, { sensitivity: "base" });
+}
+
+function MetricLineChart({ points }: { points: TrainingStatistic["latestMetrics"] }) {
+  const values = points.map((point) => point.loss).filter((value): value is number => typeof value === "number");
+  if (values.length === 0) return null;
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const span = Math.max(0.000001, maximum - minimum);
+  const coordinates = values.map((value, index) => {
+    const x = values.length === 1 ? 50 : 4 + (index / (values.length - 1)) * 92;
+    const y = 8 + ((maximum - value) / span) * 72;
+    return `${x},${y}`;
+  }).join(" ");
+  return <div className="metric-line-chart" aria-label="Training loss line chart">
+    <svg viewBox="0 0 100 92" preserveAspectRatio="none" role="img">
+      <line x1="4" y1="8" x2="96" y2="8" />
+      <line x1="4" y1="44" x2="96" y2="44" />
+      <line x1="4" y1="80" x2="96" y2="80" />
+      <polyline points={coordinates} />
+    </svg>
+    <span className="chart-maximum">{maximum.toFixed(4)}</span>
+    <span className="chart-minimum">{minimum.toFixed(4)}</span>
+    <small>step {points[0]?.trainingStep ?? 0}</small>
+    <small>step {points.at(-1)?.trainingStep ?? 0}</small>
+  </div>;
+}
+
+function StatisticsPage({ jobs, decks, training, metricWindow, onMetricWindowChange }: { jobs: Job[]; decks: DeckStatistic[]; training: TrainingStatistic[]; metricWindow: TrainingStatistic["metricWindow"]; onMetricWindowChange: (window: TrainingStatistic["metricWindow"]) => void }) {
   const [selectedId, setSelectedId] = useState("");
+  const [settings, setSettings] = useState<TrainingSettings | null>(null);
+  const [curriculum, setCurriculum] = useState<TrainingCurriculum | null>(null);
+  const [evidence, setEvidence] = useState<TrainingEvidence | null>(null);
+  const [replays, setReplays] = useState<SavedReplaySummary[]>([]);
+  const [replay, setReplay] = useState<SavedReplay | null>(null);
+  const [replayFrame, setReplayFrame] = useState(0);
+  const [replayLease, setReplayLease] = useState<{ modelId: string; replayId: string; leaseId: string } | null>(null);
+  const [platformMessage, setPlatformMessage] = useState("");
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [agentTraining, setAgentTraining] = useState<AgentTrainingPublication | null>(null);
+  const [agentParameters, setAgentParameters] = useState<Record<string, string | number | boolean>>({});
+  const [selectedPhaseId, setSelectedPhaseId] = useState("");
+  const [pendingPhaseId, setPendingPhaseId] = useState("");
+  const [phaseBusy, setPhaseBusy] = useState(false);
+  const [phaseFeedback, setPhaseFeedback] = useState<{ tone: "progress" | "success" | "error"; message: string } | null>(null);
+  const [deckSort, setDeckSort] = useState(initialDeckSort);
   const runs = jobs.filter((job) => job.kind.startsWith("training."));
   const selected = training.find((item) => item.modelId === selectedId) ?? training[0];
   const selectedDecks = selected ? decks.filter((deck) => deck.modelId === selected.modelId) : decks;
+  const sortedSelectedDecks = [...selectedDecks].sort((left, right) => (
+    compareDeckStatistics(left, right, deckSort.key, deckSort.direction)
+  ));
   const decidedGames = selectedDecks.reduce((total, deck) => total + deck.gameWins + deck.gameLosses, 0);
   const wins = selectedDecks.reduce((total, deck) => total + deck.gameWins, 0);
   const lossPoints = selected?.latestMetrics.filter((point) => typeof point.loss === "number") ?? [];
-  const maximumLoss = Math.max(0.0001, ...lossPoints.map((point) => Math.abs(point.loss ?? 0)));
+  const lossNames = [...new Set(lossPoints.flatMap((point) => Object.keys(point.losses ?? {})))];
+  const publishedMetricDescriptions = new Map(agentTraining?.contract.phases.flatMap((phase) => phase.metrics.map((metric) => [metric.key, metric.description])) ?? []);
+  const summary = selected?.windowSummary;
+  const rewardValues = selected?.latestMetrics.map((point) => point.episodeReward).filter((value): value is number => typeof value === "number") ?? [];
+  const meanReward = rewardValues.length ? rewardValues.reduce((total, value) => total + value, 0) / rewardValues.length : null;
+  const isInProcessRl = summary?.sampleType === "rl-episodes";
+  const activeTrainingJob = selected
+    ? jobs.find((job) => job.model_id === selected.modelId && job.kind === "training.pool" && ["queued", "running"].includes(job.status))
+    : undefined;
+  const latestSelectedTrainingJob = selected
+    ? jobs.find((job) => job.model_id === selected.modelId && job.kind === "training.pool")
+    : undefined;
+  const latestSelectedTrainingLog = latestSelectedTrainingJob?.logs.filter((line) => line.trim()).at(-1);
+  const activePhaseId = typeof agentTraining?.state?.phase === "string" ? agentTraining.state.phase : "";
+  const activePhaseStatus = String(agentTraining?.state?.status ?? "");
+  const selectedPhase = agentTraining?.contract.phases.find((phase) => phase.id === selectedPhaseId)
+    ?? agentTraining?.contract.phases.find((phase) => phase.id === activePhaseId)
+    ?? agentTraining?.contract.phases[0];
+  useEffect(() => {
+    if (!selected?.modelId) return;
+    let live = true;
+    setPlatformMessage("");
+    setAgentTraining(null);
+    setReplay(null);
+    setReplayLease(null);
+    setReplayFrame(0);
+    Promise.all([
+      loadTrainingSettings(selected.modelId),
+      loadTrainingCurriculum(),
+      loadTrainingEvidence(selected.modelId),
+      loadSavedReplays(selected.modelId),
+      loadAgentTrainingContract(selected.modelId),
+    ]).then(([nextSettings, nextCurriculum, nextEvidence, nextReplays, nextAgentTraining]) => {
+      if (!live) return;
+      setSettings(nextSettings);
+      setCurriculum(nextCurriculum);
+      setEvidence(nextEvidence);
+      setReplays(nextReplays);
+      setAgentTraining(nextAgentTraining);
+      setAgentParameters(Object.fromEntries(nextAgentTraining?.contract.phases.flatMap((phase) => phase.parameters.map((parameter) => [parameter.key, nextAgentTraining.parameterValues?.[parameter.key] ?? parameter.default ?? ""])) ?? []));
+      setSelectedPhaseId(String(nextAgentTraining?.state?.phase ?? nextAgentTraining?.contract.phases[0]?.id ?? ""));
+    }).catch((reason) => {
+      if (live) setPlatformMessage(reason instanceof Error ? reason.message : "Unable to load training controls.");
+    });
+    return () => { live = false; };
+  }, [selected?.modelId]);
+
+  useEffect(() => {
+    if (!latestSelectedTrainingJob) return;
+    if (latestSelectedTrainingJob.status === "failed") {
+      setPhaseFeedback({ tone: "error", message: `Training failed: ${latestSelectedTrainingLog || `trainer exited with code ${latestSelectedTrainingJob.exit_code ?? "unknown"}`}` });
+    } else if (latestSelectedTrainingJob.status === "queued") {
+      setPhaseFeedback({ tone: "progress", message: "Training is queued. The controller is preparing the selected phaseâ€¦" });
+    } else if (latestSelectedTrainingJob.status === "running") {
+      setPhaseFeedback({ tone: "progress", message: latestSelectedTrainingLog || "Trainer started. Waiting for the first completed self-play stepâ€¦" });
+    } else if (latestSelectedTrainingJob.status === "completed") {
+      setPhaseFeedback({ tone: "success", message: "Training completed and the latest checkpoint was saved." });
+    }
+  }, [latestSelectedTrainingJob, latestSelectedTrainingLog]);
+
+  useEffect(() => {
+    if (!selected?.modelId) return;
+    const interval = window.setInterval(() => {
+      void loadAgentTrainingContract(selected.modelId).then((publication) => {
+        if (publication) setAgentTraining(publication);
+      });
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [selected?.modelId]);
+
+  useEffect(() => {
+    if (!pendingPhaseId || activeTrainingJob || !selected || !agentTraining) return;
+    const phase = agentTraining.contract.phases.find((item) => item.id === pendingPhaseId);
+    if (!phase) return;
+    setPendingPhaseId("");
+    setPhaseBusy(true);
+    setPhaseFeedback({ tone: "progress", message: `Starting ${phase.label}â€¦` });
+    const parameters = Object.fromEntries(
+      phase.parameters.map((parameter) => [parameter.key, agentParameters[parameter.key]]),
+    );
+    const action = phase.controls.includes("start") ? "start" : "evaluate";
+    void saveAgentTrainingControl(selected.modelId, { phase: phase.id, action, parameters })
+      .then((control) => startJob({ kind: "training.pool", model_id: selected.modelId, phase_id: phase.id }).then(() => control))
+      .then((control) => {
+        setAgentTraining((current) => current ? { ...current, control } : current);
+        setPhaseFeedback({ tone: "progress", message: `${phase.label} accepted. Waiting for the trainer process and first resultâ€¦` });
+        setPlatformMessage(`${phase.label} started with the displayed parameters.`);
+      })
+      .catch((reason) => {
+        const message = reason instanceof Error ? reason.message : "Unable to start the next training phase.";
+        setPhaseFeedback({ tone: "error", message });
+        setPlatformMessage(message);
+      })
+      .finally(() => setPhaseBusy(false));
+  }, [activeTrainingJob, agentParameters, agentTraining, pendingPhaseId, selected]);
+
+  useEffect(() => {
+    if (!replayLease) return;
+    const interval = window.setInterval(() => {
+      void renewSavedReplayLease(replayLease.modelId, replayLease.replayId, replayLease.leaseId);
+    }, 30_000);
+    return () => {
+      window.clearInterval(interval);
+      void releaseSavedReplayLease(replayLease.modelId, replayLease.replayId, replayLease.leaseId);
+    };
+  }, [replayLease]);
+
+  async function persistSettings() {
+    if (!selected || !settings) return;
+    setSavingSettings(true);
+    setPlatformMessage("");
+    try {
+      setSettings(await saveTrainingSettings(selected.modelId, settings));
+      setPlatformMessage("Training plan saved. It will apply on the next trainer start.");
+    } catch (reason) {
+      setPlatformMessage(reason instanceof Error ? reason.message : "Unable to save training controls.");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function trainOnlyScenario(scenarioId: string) {
+    if (!selected || !settings || !agentTraining || activeTrainingJob) return;
+    setPhaseBusy(true);
+    setPlatformMessage("");
+    try {
+      const focused = {
+        ...settings,
+        stages: { ...settings.stages, reinforcementLearning: true },
+        curriculum: { enabled: true, adaptive: false, scenarioIds: [scenarioId] },
+      };
+      const saved = await saveTrainingSettings(selected.modelId, focused);
+      setSettings(saved);
+      const phase = "reinforcement-learning";
+      const control = await saveAgentTrainingControl(selected.modelId, {
+        phase,
+        action: "start",
+        parameters: phaseParameters(phase),
+      });
+      await startJob({ kind: "training.pool", model_id: selected.modelId, phase_id: phase });
+      setAgentTraining({ ...agentTraining, control });
+      setPhaseFeedback({ tone: "progress", message: `Focused scenario ${scenarioId} is starting.` });
+      setPlatformMessage(`Training started with only ${scenarioId}.`);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "Unable to start this focused scenario.";
+      setPhaseFeedback({ tone: "error", message });
+      setPlatformMessage(message);
+    } finally {
+      setPhaseBusy(false);
+    }
+  }
+
+  async function openReplay(item: SavedReplaySummary) {
+    if (!selected) return;
+    setPlatformMessage("");
+    try {
+      const acquired = await acquireSavedReplay(selected.modelId, item.id);
+      setReplay(acquired.replay);
+      setReplayLease(acquired.leaseId ? { modelId: selected.modelId, replayId: item.id, leaseId: acquired.leaseId } : null);
+      setReplays((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, viewing: true } : candidate));
+      setReplayFrame(0);
+    } catch (reason) {
+      setPlatformMessage(reason instanceof Error ? reason.message : "Unable to open the saved game.");
+    }
+  }
+
+  async function keepReplayForever() {
+    if (!selected || !replay) return;
+    setPlatformMessage("");
+    try {
+      await saveReplayForever(selected.modelId, replay.id);
+      setReplays((current) => current.map((candidate) => candidate.id === replay.id ? { ...candidate, saved: true, viewing: true } : candidate));
+      setReplayLease(null);
+      setPlatformMessage("Replay saved permanently. Retention cleanup will never remove it.");
+    } catch (reason) {
+      setPlatformMessage(reason instanceof Error ? reason.message : "Unable to save this replay.");
+    }
+  }
+
+  function phaseParameters(phase: string) {
+    const phaseContract = agentTraining?.contract.phases.find((item) => item.id === phase);
+    return Object.fromEntries(phaseContract?.parameters.map((parameter) => [parameter.key, agentParameters[parameter.key]]) ?? []);
+  }
+
+  async function launchPhase(phase: string) {
+    if (!selected || !agentTraining) return;
+    const phaseContract = agentTraining.contract.phases.find((item) => item.id === phase);
+    if (!phaseContract) return;
+    if (activeTrainingJob) {
+      if (activePhaseId === phase) {
+        setPhaseFeedback({ tone: "success", message: `${phaseContract.label} is already running.` });
+        setPlatformMessage(`${phaseContract.label} is already running.`);
+        return;
+      }
+      setPhaseBusy(true);
+      setPhaseFeedback({ tone: "progress", message: `Stopping the current phase safely before ${phaseContract.label} startsâ€¦` });
+      try {
+        if (activePhaseId) {
+          const active = agentTraining.contract.phases.find((item) => item.id === activePhaseId);
+          if (active?.controls.includes("stop")) {
+            await saveAgentTrainingControl(selected.modelId, { phase: activePhaseId, action: "stop", parameters: {} });
+          } else {
+            await stopJob(activeTrainingJob.id);
+          }
+        } else {
+          await stopJob(activeTrainingJob.id);
+        }
+        setPendingPhaseId(phase);
+        setPlatformMessage(`Stopping the current phase safely; ${phaseContract.label} will start automatically.`);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : "Unable to switch training phases.";
+        setPhaseFeedback({ tone: "error", message });
+        setPlatformMessage(message);
+      } finally {
+        setPhaseBusy(false);
+      }
+      return;
+    }
+    setPhaseBusy(true);
+    setPhaseFeedback({ tone: "progress", message: `Starting ${phaseContract.label}â€¦ Validating parameters and preparing the trainer.` });
+    setPlatformMessage("");
+    try {
+      const action = phaseContract.controls.includes("start") ? "start" : "evaluate";
+      const control = await saveAgentTrainingControl(selected.modelId, { phase, action, parameters: phaseParameters(phase) });
+      await startJob({ kind: "training.pool", model_id: selected.modelId, phase_id: phase });
+      setAgentTraining({ ...agentTraining, control });
+      setPhaseFeedback({ tone: "progress", message: `${phaseContract.label} accepted. Waiting for the trainer process and first resultâ€¦` });
+      setPlatformMessage(`${phaseContract.label} started with the displayed parameters.`);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "Unable to start this training phase.";
+      setPhaseFeedback({ tone: "error", message });
+      setPlatformMessage(message);
+    } finally {
+      setPhaseBusy(false);
+    }
+  }
+
+  async function requestAgentControl(phase: string, action: string) {
+    if (!selected || !agentTraining) return;
+    if (action === "start" || action === "evaluate") {
+      await launchPhase(phase);
+      return;
+    }
+    setPhaseBusy(true);
+    setPlatformMessage("");
+    try {
+      const control = await saveAgentTrainingControl(selected.modelId, { phase, action, parameters: phaseParameters(phase) });
+      setAgentTraining({ ...agentTraining, control });
+      setPlatformMessage(`${action} requested for ${agentTraining.contract.phases.find((item) => item.id === phase)?.label ?? phase}.`);
+    } catch (reason) {
+      setPlatformMessage(reason instanceof Error ? reason.message : "Unable to control this agent.");
+    } finally {
+      setPhaseBusy(false);
+    }
+  }
+
+  const selectedPhaseMetrics = (agentTraining?.metrics ?? []).filter((record) => record.phase === selectedPhase?.id);
+  const latestPhaseMetrics = selectedPhaseMetrics.at(-1);
+  const previousPhaseMetrics = selectedPhaseMetrics.at(-2);
+  const formatPhaseMetric = (value: number | undefined, kind: string) => {
+    if (value === undefined) return "—";
+    if (kind === "rate") return `${(value * 100).toFixed(1)}%`;
+    return Math.abs(value) >= 100 ? value.toFixed(0) : value.toFixed(4);
+  };
+
+  const activeReplaySummary = replay ? replays.find((item) => item.id === replay.id) : undefined;
+  const replayDeckLabels = Array.isArray(replay?.metadata.decks)
+    ? replay.metadata.decks.map(String)
+    : [];
+  const replayDeckVersionIds = selectedDecks
+    .filter((deck) => replayDeckLabels.length === 0 || replayDeckLabels.some((label) => label.includes(deck.deckName)))
+    .map((deck) => deck.deckVersionId);
+  const evidenceTrend = evidence?.trend.filter((point) => point.winRate !== null) ?? [];
+  const evidenceTrendPoints = evidenceTrend.map((point, index) => `${evidenceTrend.length === 1 ? 50 : 4 + (index / (evidenceTrend.length - 1)) * 92},${82 - (point.winRate ?? 0) * 72}`).join(" ");
+  const seconds = (value: number | null | undefined) => value == null ? "—" : value < 60 ? `${value.toFixed(1)}s` : `${(value / 60).toFixed(1)}m`;
+  const sortDecksBy = (key: DeckSortKey) => {
+    setDeckSort((current) => current.key === key
+      ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: key === "deck" || key === "rank" ? "asc" : "desc" });
+  };
+  const deckSortHeader = (key: DeckSortKey, label: string) => {
+    const active = deckSort.key === key;
+    return <span role="columnheader" aria-sort={active ? (deckSort.direction === "asc" ? "ascending" : "descending") : "none"}>
+      <button type="button" className={active ? "stats-sort-button active" : "stats-sort-button"} onClick={() => sortDecksBy(key)}>
+        {label}<i aria-hidden="true">{active ? deckSort.direction === "asc" ? "↑" : "↓" : "↕"}</i>
+      </button>
+    </span>;
+  };
   return <section className="statistics-page">
-    <section className="statistics-toolbar"><div><span className="eyebrow">Local training history</span><h2>{selected?.modelName ?? "No trained agent yet"}</h2></div>{training.length > 0 && <label>Agent<select value={selected?.modelId ?? ""} onChange={(event) => setSelectedId(event.target.value)}>{training.map((item) => <option value={item.modelId} key={item.modelId}>{item.modelName} · {item.architecture.toUpperCase()}</option>)}</select></label>}</section>
-    <div className="stats-summary training-kpis"><article><span>Completed games</span><strong>{selected?.completedGames ?? 0}</strong><small>{selected?.activeGames ?? 0} live now</small></article><article><span>Training updates</span><strong>{selected?.trainingStep ?? 0}</strong><small>{selected?.parallelGames ?? 0} simultaneous slots</small></article><article><span>Deck-pool win rate</span><strong>{decidedGames ? `${Math.round((wins / decidedGames) * 100)}%` : "—"}</strong><small>{decidedGames} decided games</small></article><article><span>Average game</span><strong>{selected?.averageGameSeconds ? `${selected.averageGameSeconds.toFixed(1)}s` : "—"}</strong><small>{selected?.phase ?? "not started"}</small></article></div>
-    <section className="panel training-curve"><div className="section-heading"><div><span className="eyebrow">Last {lossPoints.length} PPO updates</span><h2>Learning curve</h2><p className="section-lead">Total loss by training update. Hover a bar for policy, value and entropy details.</p></div>{selected && <span className={`training-phase ${selected.activeGames ? "live" : ""}`}>{selected.activeGames ? "● collecting games" : selected.desiredState}</span>}</div>
-      {lossPoints.length === 0 ? <div className="empty"><span>↗</span><p>The curve appears after the first completed training game.</p></div> : <div className="loss-chart" aria-label="Training loss chart">{lossPoints.map((point, index) => <i key={`${point.trainingStep}-${index}`} style={{ height: `${Math.max(4, (Math.abs(point.loss ?? 0) / maximumLoss) * 100)}%` }} title={`Step ${point.trainingStep} · loss ${point.loss?.toFixed(4)} · policy ${point.policyLoss?.toFixed(4) ?? "—"} · value ${point.valueLoss?.toFixed(4) ?? "—"} · entropy ${point.entropy?.toFixed(4) ?? "—"}`}><span>{point.loss?.toFixed(3)}</span></i>)}</div>}
+    <section className="statistics-toolbar"><div><span className="eyebrow">Local training history</span><h2>{selected?.modelName ?? "No trained agent yet"}</h2></div><div className="statistics-filters">{training.length > 0 && <label>Agent<select value={selected?.modelId ?? ""} onChange={(event) => setSelectedId(event.target.value)}>{training.map((item) => <option value={item.modelId} key={item.modelId}>{item.modelName} · {item.architecture.toUpperCase()}</option>)}</select></label>}<label>Window<select aria-label="Metric window" value={metricWindow} onChange={(event) => onMetricWindowChange(event.target.value as TrainingStatistic["metricWindow"])}><option value="50">Last 50</option><option value="200">Last 200</option><option value="1000">Last 1,000</option><option value="5000">Last 5,000</option><option value="all">All time</option></select></label></div></section>
+    <div className="stats-summary training-kpis"><article><span>{isInProcessRl ? "Completed RL episodes" : "Completed games"}</span><strong>{selected?.completedGames ?? 0}</strong><small>{selected?.activeGames ?? 0} live now</small></article><article><span>Training updates</span><strong>{selected?.trainingStep ?? 0}</strong><small>{selected?.parallelGames ?? 0} simultaneous slots</small></article><article><span>{isInProcessRl ? "Mean window reward" : "Deck-pool win rate"}</span><strong>{isInProcessRl ? meanReward?.toFixed(3) ?? "—" : decidedGames ? `${Math.round((wins / decidedGames) * 100)}%` : "—"}</strong><small>{isInProcessRl ? `${rewardValues.length} PPO rollouts` : `${decidedGames} decided games`}</small></article><article><span>{isInProcessRl ? "Average episode" : "Average game"}</span><strong>{selected?.averageGameSeconds ? `${selected.averageGameSeconds.toFixed(1)}s` : "—"}</strong><small>{selected?.phase ?? "not started"}</small></article></div>
+    {evidence && <section className={`panel evidence-panel evidence-${evidence.status}`}><div className="section-heading"><div><span className="eyebrow">Magic skill evidence</span><h2>{evidence.status === "verified" ? "Progression verified" : evidence.status === "not-connected" ? "Not proven on Magic" : evidence.status === "not-evaluated" ? "Evaluation required" : evidence.status === "insufficient" ? "Early evidence only" : "Performance measured"}</h2><p className="section-lead">{evidence.verdict}</p></div><span className="evidence-badge">{evidence.magicEvidence ? `${evidence.games} Engine games` : "No Engine evidence"}</span></div>
+      <div className="evidence-layout"><div className="evidence-kpis"><article><span>Fixed-seed win rate</span><strong>{evidence.winRate == null ? "—" : `${(evidence.winRate * 100).toFixed(1)}%`}</strong><small>{evidence.lower95 == null || evidence.upper95 == null ? "No interval yet" : `95% CI ${(evidence.lower95 * 100).toFixed(1)}–${(evidence.upper95 * 100).toFixed(1)}%`}</small></article><article><span>Record</span><strong>{evidence.wins}–{evidence.losses}–{evidence.draws}</strong><small>win–loss–draw vs {selected?.architecture === "v13" ? "frozen pre-Engine baseline" : "saved champion"}</small></article><article><span>Promotions</span><strong>{evidence.promotions}</strong><small>{evidence.fixedSeeds ? "reproducible fixed seeds" : "fixed seeds not confirmed"}</small></article></div>
+      <div className="evidence-trend"><span>Evaluation trend</span>{evidenceTrend.length ? <svg viewBox="0 0 100 90" preserveAspectRatio="none"><line x1="4" y1="46" x2="96" y2="46" /><polyline points={evidenceTrendPoints} /></svg> : <p>Run an Engine evaluation period to create this curve.</p>}</div></div>
+      {evidence.byDeck.length > 0 && <div className="evidence-decks"><strong>Controlled results by deck</strong>{evidence.byDeck.map((deck) => <span key={deck.deck}><b>{deck.deck}</b><em>{deck.wins}–{deck.losses}–{deck.draws}</em><small>{deck.winRate == null ? "—" : `${(deck.winRate * 100).toFixed(1)}%`} · 95% CI {deck.lower95 == null || deck.upper95 == null ? "—" : `${(deck.lower95 * 100).toFixed(0)}–${(deck.upper95 * 100).toFixed(0)}%`}</small></span>)}</div>}
+      {(evidence.curriculum?.byScenario.length ?? 0) > 0 && <div className="curriculum-evidence"><strong>Focused skills · weakest first</strong><div>{evidence.curriculum.byScenario.map((scenario) => <article key={scenario.scenarioId}><span>{scenario.scenarioId.replaceAll("-", " ")}</span><b>{scenario.successRate == null ? "—" : `${(scenario.successRate * 100).toFixed(0)}%`}</b><small>{scenario.successes}/{scenario.games} successes · {scenario.averageRound == null ? "—" : `${scenario.averageRound.toFixed(1)} turns`} · {scenario.averageMilestoneProgress == null ? "" : `${(scenario.averageMilestoneProgress * 100).toFixed(0)}% line · `}{scenario.averageDamageProgress == null ? "" : `${(scenario.averageDamageProgress * 100).toFixed(0)}% damage · `}{scenario.averageSideboardCards == null ? "" : `${scenario.averageSideboardCards.toFixed(1)} sideboard cards · `}{scenario.sideboardTargetCoverage == null ? "" : `${(scenario.sideboardTargetCoverage * 100).toFixed(0)}% cards in · `}{scenario.sideboardCutCoverage == null ? "" : `${(scenario.sideboardCutCoverage * 100).toFixed(0)}% cards out · `}weight {scenario.adaptiveWeight?.toFixed(2) ?? "—"}</small><i>{scenario.recent.map((success, index) => <em className={success ? "success" : "failure"} key={`${scenario.scenarioId}-${index}`} />)}</i></article>)}</div></div>}
+      {evidence.curriculum?.latestEvaluation && <div className="curriculum-holdout"><strong>Fixed-seed curriculum evaluation</strong><span><b>{(evidence.curriculum.latestEvaluation.successRate * 100).toFixed(0)}%</b> success</span><span><b>{(evidence.curriculum.latestEvaluation.meanMastery * 100).toFixed(0)}%</b> mastery</span><small>{evidence.curriculum.latestEvaluation.completedScenarios}/{evidence.curriculum.latestEvaluation.expectedScenarios} scenarios · {evidence.curriculum.latestEvaluation.recoveredScenarios ?? 0} recovered · {evidence.curriculum.latestEvaluation.engineErrors ?? evidence.curriculum.latestEvaluation.failedScenarios} Engine errors · {evidence.curriculum.evaluationPeriods} periods</small></div>}
+    </section>}
+    {agentTraining && selectedPhase && <section className="panel training-controls phase-cockpit"><div className="section-heading"><div><span className="eyebrow">Agent SDK · phase cockpit</span><h2>Run, inspect, adjust, repeat</h2><p className="section-lead">Choose one phase, see its own results and parameters, then start or switch without leaving this page.</p></div><span className={`evidence-badge ${activeTrainingJob ? "live" : ""}`}>{activeTrainingJob ? `● ${String(agentTraining.state?.status ?? "running")}` : "idle"}</span></div>
+      <nav className="phase-rail" aria-label="Training phases">{agentTraining.contract.phases.map((phase, index) => {
+        const records = (agentTraining.metrics ?? []).filter((record) => record.phase === phase.id);
+        const isActive = activePhaseId === phase.id && Boolean(activeTrainingJob);
+        return <button type="button" className={`${selectedPhase.id === phase.id ? "selected" : ""} ${isActive ? "active" : ""}`} key={phase.id} onClick={() => setSelectedPhaseId(phase.id)}><span>{index + 1}</span><strong>{phase.label}</strong><small>{isActive ? "running now" : records.length ? `${records.length} results` : "ready"}</small></button>;
+      })}</nav>
+      <div className="phase-workbench"><article className="phase-results"><header><div><span className="eyebrow">Results · step {latestPhaseMetrics?.step ?? "—"}</span><h3>{selectedPhase.label}</h3><p>{selectedPhase.description}</p></div><AsyncActionButton className="primary" type="button" loading={phaseBusy || pendingPhaseId === selectedPhase.id} loadingLabel={pendingPhaseId === selectedPhase.id ? "Waiting to switch…" : "Preparing phase…"} disabled={Boolean(activeTrainingJob && activePhaseId === selectedPhase.id)} onClick={() => void launchPhase(selectedPhase.id)}>{activeTrainingJob && activePhaseId !== selectedPhase.id ? "Switch to this phase" : activeTrainingJob ? activePhaseStatus === "paused" ? "Paused" : "Running" : selectedPhase.id === "engine-evaluation" ? "Run evaluation" : "Start phase"}</AsyncActionButton></header>
+        <div className="phase-metric-grid">{selectedPhase.metrics.map((metric) => {
+          const value = latestPhaseMetrics?.metrics[metric.key];
+          const previous = previousPhaseMetrics?.metrics[metric.key];
+          const delta = value !== undefined && previous !== undefined ? value - previous : undefined;
+          const improving = delta !== undefined && ((metric.direction === "minimize" && delta < 0) || (metric.direction === "maximize" && delta > 0));
+          return <span key={metric.key}><small>{metric.label}<button type="button" className="metric-info" aria-label={`About ${metric.label}`} data-help={metric.description} title={metric.description}>i</button></small><strong>{formatPhaseMetric(value, metric.kind)}</strong><em className={delta === undefined ? "" : improving ? "improving" : "watch"}>{delta === undefined ? metric.direction : `${delta > 0 ? "+" : ""}${delta.toFixed(4)} vs prior`}</em></span>;
+        })}</div>
+        {selectedPhaseMetrics.length === 0 && <p className="phase-empty">No result yet for this phase. Starting it will populate these cards automatically.</p>}
+      </article>
+      <aside className="phase-setup"><header><span className="eyebrow">Parameters</span><strong>{selectedPhase.label}</strong></header><div className="training-parameter-grid">{selectedPhase.parameters.map((parameter) => <label key={parameter.key}>{parameter.label}<span className="apply-boundary">{parameter.apply.replace("-", " ")}</span>{parameter.kind === "boolean" ? <input type="checkbox" checked={Boolean(agentParameters[parameter.key])} onChange={(event) => setAgentParameters({ ...agentParameters, [parameter.key]: event.target.checked })} /> : parameter.kind === "choice" ? <select value={String(agentParameters[parameter.key] ?? "")} onChange={(event) => setAgentParameters({ ...agentParameters, [parameter.key]: event.target.value })}>{parameter.choices.map((choice) => <option key={String(choice)} value={String(choice)}>{String(choice)}</option>)}</select> : <input type={parameter.kind === "integer" || parameter.kind === "number" ? "number" : "text"} min={parameter.min ?? undefined} max={parameter.max ?? undefined} step={parameter.step ?? (parameter.kind === "integer" ? 1 : undefined)} value={String(agentParameters[parameter.key] ?? "")} onChange={(event) => setAgentParameters({ ...agentParameters, [parameter.key]: parameter.kind === "integer" || parameter.kind === "number" ? Number(event.target.value) : event.target.value })} />}<small>{parameter.description || `Applied ${parameter.apply.replace("-", " ")}.`}</small></label>)}</div>
+        {activePhaseId === selectedPhase.id && activeTrainingJob && <div className="agent-contract-actions">{selectedPhase.controls.filter((action) => action !== "start" && action !== "evaluate" && (action !== "pause" || activePhaseStatus !== "paused") && (action !== "resume" || activePhaseStatus === "paused")).map((action) => <button type="button" disabled={phaseBusy} key={action} onClick={() => void requestAgentControl(selectedPhase.id, action)}>{action}</button>)}</div>}
+      </aside></div>
+      {phaseFeedback && <div className={`training-operation-status phase-feedback ${phaseFeedback.tone}`} role={phaseFeedback.tone === "error" ? "alert" : "status"} aria-live="polite">{phaseFeedback.tone === "progress" && <span className="inline-spinner" aria-hidden="true" />}<span>{phaseFeedback.message}</span></div>}
+      {platformMessage && <p className="training-platform-message" role="status">{platformMessage}</p>}
+    </section>}
+    {settings && <section className="panel training-controls"><div className="section-heading"><div><span className="eyebrow">Training cockpit</span><h2>Stages, retention and evaluation cadence</h2><p className="section-lead">Changes are validated and applied the next time this trainer starts.</p></div><AsyncActionButton className="primary" type="button" loading={savingSettings} loadingLabel="Saving training plan…" onClick={() => void persistSettings()}>Save training plan</AsyncActionButton></div>
+      <div className="training-stage-grid"><label className={settings.architecture !== "v13" ? "unavailable" : ""}><input type="checkbox" disabled={settings.architecture !== "v13"} checked={settings.stages.worldModel} onChange={(event) => setSettings({ ...settings, stages: { ...settings.stages, worldModel: event.target.checked } })} /><span><strong>1 · World model</strong><small>Graph reconstruction, dynamics and belief pretraining.</small></span></label><label><input type="checkbox" checked={settings.stages.reinforcementLearning} onChange={(event) => setSettings({ ...settings, stages: { ...settings.stages, reinforcementLearning: event.target.checked } })} /><span><strong>2 · Reinforcement learning</strong><small>Policy/value optimization from self-play trajectories.</small></span></label><label className={!settings.engineEvaluationSupported ? "unavailable" : ""}><input type="checkbox" disabled={!settings.engineEvaluationSupported} checked={settings.stages.engineEvaluation} onChange={(event) => setSettings({ ...settings, stages: { ...settings.stages, engineEvaluation: event.target.checked } })} /><span><strong>3 · Engine evaluation</strong><small>{settings.engineEvaluationSupported ? "Fixed-seed games against the current champion." : "V13 Engine action integration is still required."}</small></span></label></div>
+      {settings.architecture === "v13" && curriculum && <div className="curriculum-workbench"><div className="training-pool-heading"><div><strong>Focused game curriculum</strong><small>Short controlled games train one skill at a time; failed scenarios are sampled more often.</small></div><label className="curriculum-master"><input type="checkbox" checked={settings.curriculum.enabled} onChange={(event) => setSettings({ ...settings, curriculum: { ...settings.curriculum, enabled: event.target.checked } })} /> Enable</label></div>
+        <label className="check-setting"><input type="checkbox" disabled={!settings.curriculum.enabled} checked={settings.curriculum.adaptive} onChange={(event) => setSettings({ ...settings, curriculum: { ...settings.curriculum, adaptive: event.target.checked } })} /><span><strong>Adaptive difficulty</strong><small>Increase sampling weight for scenarios with a low recent success rate.</small></span></label>
+        <div className="curriculum-grid">{curriculum.scenarios.map((scenario) => {
+          const selectedScenario = settings.curriculum.scenarioIds.length === 0 || settings.curriculum.scenarioIds.includes(scenario.id);
+          return <label className={`${selectedScenario ? "selected" : ""} ${!settings.curriculum.enabled ? "unavailable" : ""}`} key={scenario.id}><input type="checkbox" disabled={!settings.curriculum.enabled} checked={selectedScenario} onChange={() => {
+            const current = settings.curriculum.scenarioIds.length === 0 ? curriculum.scenarios.map((item) => item.id) : settings.curriculum.scenarioIds;
+            const scenarioIds = selectedScenario ? current.filter((id) => id !== scenario.id) : [...current, scenario.id];
+            setSettings({ ...settings, curriculum: { ...settings.curriculum, scenarioIds } });
+          }} /><span><strong>{scenario.label}</strong><small>{scenario.description}</small><em>Difficulty {scenario.difficulty}/5 · {scenario.tags.join(" · ")}</em>{scenario.fixed_hand.length > 0 && <small>Fixed hand: {scenario.fixed_hand.join(", ")}</small>}{scenario.opening_hand_roles.length > 0 && <small>Hand roles: {scenario.opening_hand_roles.map((role) => role.join(" / ")).join(" · ")}</small>}{scenario.success_action_sequence.length > 0 && <small>Required line: {scenario.success_action_sequence.join(" → ")}</small>}{scenario.sideboard_target_cards.length > 0 && <small>Bring in: {scenario.sideboard_target_cards.join(", ")}</small>}{scenario.sideboard_cut_cards.length > 0 && <small>Take out: {scenario.sideboard_cut_cards.join(", ")}</small>}<button type="button" disabled={Boolean(activeTrainingJob) || phaseBusy} onClick={(event) => { event.preventDefault(); event.stopPropagation(); void trainOnlyScenario(scenario.id); }}>Train only this</button></span></label>;
+        })}</div>
+      </div>}
+      <div className="training-parameter-grid"><label>Saved games<input type="number" min="0" max="500" value={settings.savedGameLimit} onChange={(event) => setSettings({ ...settings, savedGameLimit: Number(event.target.value) })} /><small>Keep the most recent complete Engine replays. 0 disables capture.</small></label><label>Checkpoint every<input type="number" min="1" value={settings.checkpointEvery} onChange={(event) => setSettings({ ...settings, checkpointEvery: Number(event.target.value) })} /></label><label>Evaluate every<input type="number" min="1" value={settings.evaluationEvery} onChange={(event) => setSettings({ ...settings, evaluationEvery: Number(event.target.value) })} /><small>{settings.architecture === "v13" ? "PPO updates between paired fixed-seed evaluations." : "Completed training games between evaluations."}</small></label><label>Games / scenario<input type="number" min="1" max="100" value={settings.evaluationGamesPerScenario} onChange={(event) => setSettings({ ...settings, evaluationGamesPerScenario: Number(event.target.value) })} /></label>{settings.architecture === "v13" && <><label>World-model steps<input type="number" min="0" value={settings.targets.worldModelSteps} onChange={(event) => setSettings({ ...settings, targets: { ...settings.targets, worldModelSteps: Number(event.target.value) } })} /></label><label>RL episodes<input type="number" min="0" value={settings.targets.reinforcementLearningEpisodes} onChange={(event) => setSettings({ ...settings, targets: { ...settings.targets, reinforcementLearningEpisodes: Number(event.target.value) } })} /></label></>}</div>
+      {platformMessage && <p className="training-platform-message" role="status">{platformMessage}</p>}
+    </section>}
+    <section className="panel training-curve"><div className="section-heading"><div><span className="eyebrow">{selected?.metricRecordCount ?? 0} records · {lossPoints.length} plotted points</span><h2>Learning curve</h2><p className="section-lead">Total loss across the selected window. Large windows are evenly downsampled for display while summaries use every record.</p></div>{selected && <span className={`training-phase ${selected.activeGames ? "live" : ""}`}>{selected.activeGames ? "● collecting games" : selected.desiredState}</span>}</div>
+      {lossPoints.length === 0 ? <div className="empty"><span>↗</span><p>The curve appears after the first completed training game.</p></div> : <MetricLineChart points={lossPoints} />}
     </section>
-    <section className="panel"><div className="section-heading"><div><span className="eyebrow">Balanced self-play matchmaking</span><h2>Deck ratings</h2><p className="section-lead">The trainer uses a Plackett–Luce rating, similar in purpose to Elo but designed for ranked multiplayer outcomes. Conservative rating (μ − 3σ) is used to sample closer matchups.</p></div></div>
+    {lossNames.length > 0 && <section className="panel objective-dashboard"><div className="section-heading"><div><span className="eyebrow">V13 objective telemetry</span><h2>Every loss, one dashboard</h2><p className="section-lead">Each objective uses its own recent range so small auxiliary losses remain readable.</p></div></div><div className="objective-grid">{lossNames.map((name) => {
+      const values = lossPoints.map((point) => point.losses?.[name]).filter((value): value is number => typeof value === "number");
+      const peak = Math.max(0.000001, ...values.map(Math.abs));
+      const points = values.map((value, index) => `${values.length === 1 ? 100 : (index / (values.length - 1)) * 100},${36 - (Math.abs(value) / peak) * 32}`).join(" ");
+      const latest = values.at(-1);
+      const help = publishedMetricDescriptions.get(name) || lossHelp(name);
+      return <article className="objective-card" key={name}><header><div className="objective-title"><span>{name.replaceAll("_", " ")}</span><button type="button" className="metric-info" aria-label={`About ${name.replaceAll("_", " ")}`} data-help={help} title={help}>i</button></div><strong>{latest?.toFixed(4) ?? "—"}</strong></header><svg viewBox="0 0 100 40" preserveAspectRatio="none" role="img" aria-label={`${name} curve`}><polyline points={points} /></svg></article>;
+    })}</div></section>}
+    {summary && <section className="panel production-dashboard"><div className="section-heading"><div><span className="eyebrow">Selected window</span><h2>{isInProcessRl ? "RL episode production and utilization" : summary.gameMetricsAvailable ? "Game production and utilization" : "Synthetic pretraining activity"}</h2><p className="section-lead">{isInProcessRl ? "On-policy PPO episodes generated in the local benchmark environment. These are real RL trajectories, not Engine Magic games." : summary.gameMetricsAvailable ? "Generated games, samples consumed by updates, latency distribution and throughput." : "V13 currently trains on synthetic graph batches; no Engine games are claimed for this run."}</p></div></div><div className="production-grid">
+      <article><span>{isInProcessRl ? "Episodes generated" : summary.gameMetricsAvailable ? "Games generated" : "Synthetic batches"}</span><strong>{summary.generatedSamples.toLocaleString()}</strong><small>{summary.gameMetricsAvailable ? `${summary.failedSamples} failed of ${summary.attemptedSamples ?? summary.generatedSamples + summary.failedSamples} attempts` : `${selected?.metricRecordCount ?? 0} metric records in this window`}</small></article>
+      <article><span>{isInProcessRl ? "Episodes used" : summary.gameMetricsAvailable ? "Games used" : "Batches used"}</span><strong>{summary.usedSamples.toLocaleString()}</strong><small>{summary.utilizationRate == null ? "—" : `${(summary.utilizationRate * 100).toFixed(1)}% utilization`}</small></article>
+      <article><span>Decisions</span><strong>{summary.gameMetricsAvailable ? summary.generatedDecisions.toLocaleString() : "—"}</strong><small>{summary.gameMetricsAvailable ? `${summary.usedDecisions.toLocaleString()} used for updates` : "Available after Engine trajectory collection"}</small></article>
+      <article><span>{isInProcessRl ? "Episode duration" : "Game duration"}</span><strong>{seconds(summary.averageGameSeconds)}</strong><small>p50 {seconds(summary.p50GameSeconds)} · p95 {seconds(summary.p95GameSeconds)}</small></article>
+      <article><span>Simulation time</span><strong>{seconds(summary.simulationSeconds)}</strong><small>{summary.gamesPerHour == null ? "No Engine games" : `${summary.gamesPerHour.toFixed(1)} ${isInProcessRl ? "episodes" : "games"}/hour`}</small></article>
+      <article><span>Model training</span><strong>{seconds(summary.trainingSeconds)}</strong><small>Collection wall {seconds(summary.collectionWallSeconds)}</small></article>
+    </div></section>}
+    <section className="panel replay-library"><div className="section-heading"><div><span className="eyebrow">Retained Engine games</span><h2>Replay library</h2><p className="section-lead">Recent games rotate automatically. An open replay is leased against deletion; a permanently saved replay never expires.</p></div><span className="evidence-badge">{replays.length} retained · {replays.filter((item) => item.saved).length} permanent</span></div>
+      {replays.length === 0 ? <div className="empty"><span>▶</span><p>No complete Engine replay has been captured for this agent yet.</p></div> : <div className="replay-workbench"><div className="replay-list">{replays.map((item) => <button type="button" className={replay?.id === item.id ? "selected" : ""} key={item.id} onClick={() => void openReplay(item)}><strong>Game {item.episode ?? item.id}</strong><span>{item.decks.join(" vs ") || item.matchupId || "Saved matchup"}</span><small>{item.saved ? "★ permanent" : item.viewing ? "● protected while open" : "temporary"} · {item.frameCount} frames · {item.roundNumber ?? "—"} rounds · {seconds(item.durationSeconds)}</small></button>)}</div>
+      <div className="replay-viewer">{!replay ? <div className="empty"><span>↗</span><p>Choose a saved game to watch it on the Pixi table.</p></div> : <><header><div><strong>{replay.id}</strong><small>Interactive Pixi replay · {replay.frames.length} frames</small></div><div>{activeReplaySummary?.saved === false && <button type="button" onClick={() => void keepReplayForever()}>Save forever</button>}</div></header><Suspense fallback={<div className="pixi-replay-loading" role="status">Loading Pixi replay…</div>}><LocalPixiReplay replay={replay} frameIndex={replayFrame} onFrameIndexChange={setReplayFrame} deckVersionIds={replayDeckVersionIds} /></Suspense></>}</div></div>}
+    </section>
+    <section className="panel"><div className="section-heading"><div><span className="eyebrow">Balanced self-play matchmaking</span><h2>Deck ratings</h2><p className="section-lead">{selected?.architecture === "v13" ? "Per-deck Engine results count every seat independently, so mirror matches remain measurable while the graph policy learns Legacy." : "The trainer uses a Plackett–Luce rating, similar in purpose to Elo but designed for ranked multiplayer outcomes. Conservative rating (μ − 3σ) is used to sample closer matchups."}</p></div></div>
       {selectedDecks.length === 0 ? <div className="empty"><span>◇</span><p>Deck ratings will appear when this agent completes games.</p></div> : <div className="stats-table deck-stats-table" role="table">
-        <div className="stats-row stats-head" role="row"><span>Agent · deck</span><span>PL rank</span><span>Conservative</span><span>μ ± σ</span><span>Matches</span><span>Game W–L</span><span>Win rate</span></div>
-        {selectedDecks.map((deck) => <div className="stats-row" role="row" key={`${deck.modelId}-${deck.deckVersionId}`}><span><strong>{deck.deckName}</strong><small>{deck.modelName} · {deck.format}</small></span><span>{deck.rank ?? "—"}</span><span>{deck.ordinal.toFixed(2)}</span><span>{deck.mu.toFixed(2)} ± {deck.sigma.toFixed(2)}</span><span>{deck.matches}</span><span>{deck.gameWins}–{deck.gameLosses}</span><span>{deck.winRate === null ? "—" : `${Math.round(deck.winRate * 100)}%`}</span></div>)}
+        <div className="stats-row stats-head" role="row">{deckSortHeader("deck", "Agent · deck")}{deckSortHeader("rank", "PL rank")}{deckSortHeader("ordinal", "Elo-like rating")}{deckSortHeader("mu", "μ ± σ")}{deckSortHeader("matches", "Matches")}{deckSortHeader("record", "Game W–L")}{deckSortHeader("winRate", "Win rate")}</div>
+        {sortedSelectedDecks.map((deck) => <div className="stats-row" role="row" key={`${deck.modelId}-${deck.deckVersionId}`}><span><strong>{deck.deckName}</strong><small>{deck.modelName} · {deck.format}</small></span><span>{deck.ratingSystem === "plackett-luce" ? deck.rank ?? "—" : "self-play"}</span><span>{deck.ratingSystem === "plackett-luce" ? deck.ordinal.toFixed(2) : "—"}</span><span>{deck.ratingSystem === "plackett-luce" ? `${deck.mu.toFixed(2)} ± ${deck.sigma.toFixed(2)}` : "—"}</span><span>{deck.matches}</span><span>{deck.gameWins}–{deck.gameLosses}{deck.draws ? `–${deck.draws}` : ""}</span><span>{deck.winRate === null ? "—" : `${Math.round(deck.winRate * 100)}%`}</span></div>)}
       </div>}
     </section>
     <section className="panel"><div className="section-heading"><div><span className="eyebrow">Stored locally in .deepdeck/learner.db</span><h2>Controller history</h2></div></div>{runs.length === 0 ? <div className="empty"><span>◇</span><p>No local training job has been launched yet.</p></div> : <div className="stats-table" role="table"><div className="stats-row stats-head" role="row"><span>Run</span><span>Status</span><span>Loss</span><span>Policy</span><span>Value</span><span>Updates</span></div>{runs.map((job) => { const metrics = trainingMetrics(job); return <div className="stats-row" role="row" key={job.id}><span><strong>{job.label}</strong><small>{new Date(job.created_at).toLocaleString()}</small></span><span>{job.status}</span><span>{metrics ? Number(metrics.loss).toFixed(4) : "—"}</span><span>{metrics ? Number(metrics.policy_loss).toFixed(4) : "—"}</span><span>{metrics ? Number(metrics.value_loss).toFixed(4) : "—"}</span><span>{metrics ? String(metrics.updates) : "—"}</span></div>; })}</div>}</section>
@@ -1859,6 +2366,7 @@ function PlaytestForm({
   const [ownDeck, setOwnDeck] = useState("");
   const [opponentDeck, setOpponentDeck] = useState("");
   const [deckSearch, setDeckSearch] = useState("");
+  const [launching, setLaunching] = useState(false);
   const [error, setError] = useState("");
   const blockers = workflowBlockers(status, "local-playtest");
   useEffect(() => {
@@ -1875,6 +2383,7 @@ function PlaytestForm({
   );
   async function submit(event: FormEvent) {
     event.preventDefault();
+    setLaunching(true);
     setError("");
     try {
       const job = await startJob({
@@ -1893,6 +2402,8 @@ function PlaytestForm({
       setError(
         reason instanceof Error ? reason.message : "Unable to launch playtest.",
       );
+    } finally {
+      setLaunching(false);
     }
   }
   return (
@@ -1924,7 +2435,7 @@ function PlaytestForm({
         </label>
         <div className="automatic-setting"><span>Format</span><strong>{format[0].toUpperCase() + format.slice(1)}</strong><small>Defined by your model's architecture.</small></div>
       </div>
-      {playableModels.length === 0 && <div className="notice warning"><strong>No playable local model yet</strong><span>Start V11 or V12 training and wait for its first local checkpoint.</span></div>}
+      {playableModels.length === 0 && <div className="notice warning"><strong>No playable local model yet</strong><span>Start training and wait for the model's first local checkpoint.</span></div>}
       <label>
         Search this model's training pool
         <input
@@ -1987,12 +2498,14 @@ function PlaytestForm({
           Plackett–Luce proximity, while preserving some matchup diversity.
         </span>
       </div>
-      <button
+      <AsyncActionButton
         className="primary"
+        loading={launching}
+        loadingLabel="Preparing game table…"
         disabled={blockers.length > 0 || !selectedModel || !ownDeck || !opponentDeck}
       >
         Launch behavior test <span>▶</span>
-      </button>
+      </AsyncActionButton>
     </form>
   );
 }
@@ -2017,6 +2530,7 @@ function MatchmakingForm({
   const [speed, setSpeed] = useState("1s");
   const [continuous, setContinuous] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [joining, setJoining] = useState(false);
   const [error, setError] = useState("");
   const blockers = workflowBlockers(status, "matchmaking");
   const competition = competitions.find(
@@ -2077,6 +2591,7 @@ function MatchmakingForm({
     event.preventDefault();
     setError("");
     if (!selectedDeck || !competition) return;
+    setJoining(true);
     try {
       await startJob({
         kind: "matchmaking.agent",
@@ -2095,6 +2610,8 @@ function MatchmakingForm({
           ? reason.message
           : "Unable to join matchmaking.",
       );
+    } finally {
+      setJoining(false);
     }
   }
 
@@ -2164,13 +2681,15 @@ function MatchmakingForm({
             placeholder="Reanimator, Alexios, Andrea…"
           />
         </label>
-        <button
+        <AsyncActionButton
           className="primary"
           type="submit"
-          disabled={searching || !status?.hosted.api_key_configured}
+          loading={searching}
+          loadingLabel="Searching decks…"
+          disabled={!status?.hosted.api_key_configured}
         >
-          {searching ? "Searching…" : "Search decks"}
-        </button>
+          Search decks
+        </AsyncActionButton>
       </form>
       {decks.length > 0 && (
         <div
@@ -2255,8 +2774,10 @@ function MatchmakingForm({
             {error}
           </p>
         )}
-        <button
+        <AsyncActionButton
           className="primary"
+          loading={joining}
+          loadingLabel="Joining matchmaking…"
           disabled={
             blockers.length > 0 ||
             !selectedDeck ||
@@ -2265,13 +2786,42 @@ function MatchmakingForm({
           }
         >
           Join matchmaking <span>→</span>
-        </button>
+        </AsyncActionButton>
       </form>
     </section>
   );
 }
 
-function JobsPanel({ jobs, refresh }: { jobs: Job[]; refresh: () => void }) {
+function JobsPanel({ jobs, refresh }: { jobs: Job[]; refresh: () => void | Promise<void> }) {
+  const [stopping, setStopping] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState("");
+
+  async function refreshJobs() {
+    setRefreshing(true);
+    setError("");
+    try {
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to refresh jobs.");
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function stop(jobId: string) {
+    setStopping(jobId);
+    setError("");
+    try {
+      await stopJob(jobId);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to stop this job.");
+    } finally {
+      setStopping("");
+    }
+  }
+
   return (
     <section className="panel jobs">
       <div className="section-heading">
@@ -2279,9 +2829,7 @@ function JobsPanel({ jobs, refresh }: { jobs: Job[]; refresh: () => void }) {
           <span className="eyebrow">Controller-owned</span>
           <h2>Recent jobs</h2>
         </div>
-        <button className="text-button" type="button" onClick={refresh}>
-          Refresh
-        </button>
+        <AsyncActionButton className="text-button" type="button" loading={refreshing} loadingLabel="Refreshingâ€¦" onClick={() => void refreshJobs()}>Refresh</AsyncActionButton>
       </div>
       {jobs.length === 0 ? (
         <div className="empty">
@@ -2302,18 +2850,22 @@ function JobsPanel({ jobs, refresh }: { jobs: Job[]; refresh: () => void }) {
                 {job.artifact_path && <code>{job.artifact_path}</code>}
               </div>
               {job.status === "running" && (
-                <button
+                <AsyncActionButton
                   className="danger"
                   type="button"
-                  onClick={() => void stopJob(job.id).then(refresh)}
+                  loading={stopping === job.id}
+                  loadingLabel="Stoppingâ€¦"
+                  disabled={Boolean(stopping)}
+                  onClick={() => void stop(job.id)}
                 >
                   Stop
-                </button>
+                </AsyncActionButton>
               )}
             </article>
           ))}
         </div>
       )}
+      {error && <p className="form-error" role="alert">{error}</p>}
     </section>
   );
 }
@@ -2328,6 +2880,7 @@ export default function App() {
   const [games, setGames] = useState<ActiveGame[]>([]);
   const [deckStatistics, setDeckStatistics] = useState<DeckStatistic[]>([]);
   const [trainingStatistics, setTrainingStatistics] = useState<TrainingStatistic[]>([]);
+  const [metricWindow, setMetricWindow] = useState<TrainingStatistic["metricWindow"]>("200");
   const [loadError, setLoadError] = useState("");
   const [setupOpen, setSetupOpen] = useState(true);
   const [trainingOpen, setTrainingOpen] = useState(true);
@@ -2335,35 +2888,45 @@ export default function App() {
   const [openedPlaytestJobId, setOpenedPlaytestJobId] = useState("");
   const pageHeading = useRef<HTMLHeadingElement>(null);
   const setupWasResolved = useRef(false);
-  const refreshInFlight = useRef(false);
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const metricWindowRef = useRef<TrainingStatistic["metricWindow"]>("200");
 
-  async function refresh() {
-    if (refreshInFlight.current) return;
-    refreshInFlight.current = true;
-    try {
-      const results = await Promise.allSettled([
-        loadStatus().then(setStatus),
-        loadAccountStatus().then(setAccount),
-        loadJobs().then(setJobs),
-        loadModels().then(setModels),
-        loadResources().then(setResources),
-        loadActiveGames().then(setGames),
-        loadDeckStatistics().then(setDeckStatistics),
-        loadTrainingStatistics().then(setTrainingStatistics),
-      ]);
-      const failure = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      setLoadError(
-        failure
-          ? failure.reason instanceof Error
-            ? failure.reason.message
-            : "Controller unavailable."
-          : "",
-      );
-    } finally {
-      refreshInFlight.current = false;
-    }
+  function changeMetricWindow(window: TrainingStatistic["metricWindow"]) {
+    metricWindowRef.current = window;
+    setMetricWindow(window);
+    void loadTrainingStatistics(window).then(setTrainingStatistics);
+  }
+
+  function refresh(): Promise<void> {
+    if (refreshInFlight.current) return refreshInFlight.current;
+    const pending = (async () => {
+      try {
+        const results = await Promise.allSettled([
+          loadStatus().then(setStatus),
+          loadAccountStatus().then(setAccount),
+          loadJobs().then(setJobs),
+          loadModels().then(setModels),
+          loadResources().then(setResources),
+          loadActiveGames().then(setGames),
+          loadDeckStatistics().then(setDeckStatistics),
+          loadTrainingStatistics(metricWindowRef.current).then(setTrainingStatistics),
+        ]);
+        const failure = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        setLoadError(
+          failure
+            ? failure.reason instanceof Error
+              ? failure.reason.message
+              : "Controller unavailable."
+            : "",
+        );
+      } finally {
+        refreshInFlight.current = null;
+      }
+    })();
+    refreshInFlight.current = pending;
+    return pending;
   }
   useEffect(() => {
     void refresh();
@@ -2633,7 +3196,7 @@ export default function App() {
             )}
           </>
         )}
-        {page === "statistics" && <StatisticsPage jobs={activityJobs} decks={deckStatistics} training={trainingStatistics} />}
+        {page === "statistics" && <StatisticsPage jobs={activityJobs} decks={deckStatistics} training={trainingStatistics} metricWindow={metricWindow} onMetricWindowChange={changeMetricWindow} />}
         {page === "representation" && (
           <section className="panel prose">
             <span className="eyebrow">Magic → tensor</span>

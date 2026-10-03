@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import LocalPixiTable from "./LocalPixiTable";
+import LocalPixiTable, { latestEngineView } from "./LocalPixiTable";
 
 vi.mock("./LocalPixiRenderer", () => ({
   default: ({ matchup, onAction, view: currentView }: {
@@ -56,6 +56,14 @@ afterEach(() => {
 });
 
 describe("local behavior test", () => {
+  test("never rolls the table back when an older poll finishes late", () => {
+    const latest = { ...view, revision: 12 };
+    const stalePoll = { ...view, revision: 11 };
+
+    expect(latestEngineView(latest, stalePoll)).toBe(latest);
+    expect(latestEngineView(stalePoll, latest)).toBe(latest);
+  });
+
   test("keeps Engine decisions usable independently from the Pixi renderer", async () => {
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if (String(_input).includes("/presentation")) {

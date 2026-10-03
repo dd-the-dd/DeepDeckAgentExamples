@@ -23,7 +23,13 @@ from deepdeck_agent import (
 from dotenv import find_dotenv, load_dotenv
 
 from .alexios import AlexiosAgent
-from .configuration import alexios_config, deep_learning_config, random_config
+from .configuration import (
+    alexios_config,
+    deep_learning_config,
+    forge_reference_config,
+    random_config,
+)
+from .forge_reference import ForgeReferenceProfile, build_forge_reference_agent
 from .oracle_checkpoint_agent import OracleCheckpointAgent, is_oracle_checkpoint
 from .random_baseline import build_random_agent
 
@@ -40,7 +46,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "example",
         nargs="?",
-        choices=("random", "alexios", "v11", "v12"),
+        choices=(
+            "random",
+            "alexios",
+            "forge-cautious",
+            "forge-balanced",
+            "forge-aggressive",
+            "v11",
+            "v12",
+            "v13",
+        ),
         default=os.getenv("DEEPDECK_EXAMPLE", "alexios"),
     )
     result.add_argument(
@@ -61,12 +76,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--checkpoint",
         default=os.getenv("DEEPDECK_CHECKPOINT"),
-        help="V11/V12 checkpoint directory containing config.json and model.pt.",
+        help="V11/V12 checkpoint directory, or a V13 directory containing rl-model.pt.",
     )
     result.add_argument(
         "--device",
         default=os.getenv("DEEPDECK_DEVICE", "cpu"),
-        help="PyTorch device used by V11/V12, for example cpu or cuda.",
+        help="PyTorch device used by V11/V12/V13, for example cpu or cuda.",
     )
     result.add_argument(
         "--allow-untrained",
@@ -138,6 +153,19 @@ def _agent_and_config(arguments: argparse.Namespace) -> tuple[Agent, AgentConfig
         return build_random_agent(arguments.seed), random_config()
     if arguments.example == "alexios":
         return AlexiosAgent(), alexios_config()
+    if arguments.example.startswith("forge-"):
+        profile = ForgeReferenceProfile(arguments.example.removeprefix("forge-"))
+        return build_forge_reference_agent(profile), forge_reference_config(profile.value)
+    if arguments.example == "v13":
+        if not arguments.checkpoint:
+            raise SystemExit("V13 requires --checkpoint")
+        try:
+            from .v13_agent import load_v13_agent
+
+            v13_agent = load_v13_agent(arguments.checkpoint, device=arguments.device)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+        return v13_agent, deep_learning_config("v13")
     if is_oracle_checkpoint(arguments.checkpoint):
         return (
             OracleCheckpointAgent(arguments.checkpoint, device=arguments.device),
