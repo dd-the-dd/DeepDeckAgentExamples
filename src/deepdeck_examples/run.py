@@ -75,6 +75,31 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--seed", type=int, default=1)
     result.add_argument(
+        "--clock-initial-ms",
+        type=int,
+        default=int(os.getenv("DEEPDECK_CLOCK_INITIAL_MS", "900000")),
+    )
+    result.add_argument(
+        "--clock-increment-ms",
+        type=int,
+        default=int(os.getenv("DEEPDECK_CLOCK_INCREMENT_MS", "2000")),
+    )
+    result.add_argument(
+        "--clock-delay-ms",
+        type=int,
+        default=int(os.getenv("DEEPDECK_CLOCK_DELAY_MS", "250")),
+    )
+    result.add_argument(
+        "--clock-max-decision-ms",
+        type=int,
+        default=int(os.getenv("DEEPDECK_CLOCK_MAX_DECISION_MS", "30000")),
+    )
+    result.add_argument(
+        "--clock-reserve-ms",
+        type=int,
+        default=int(os.getenv("DEEPDECK_CLOCK_RESERVE_MS", "30000")),
+    )
+    result.add_argument(
         "--checkpoint",
         default=os.getenv("DEEPDECK_CHECKPOINT"),
         help=(
@@ -239,6 +264,13 @@ async def _serve_local(runner: AgentRunner, arguments: argparse.Namespace) -> No
             if local_game_setup:
                 payload = json.loads(Path(local_game_setup).read_text(encoding="utf-8"))
                 payload["aiControllerByPlayerId"] = {"local-agent": controller_id}
+                payload["decisionClock"] = {
+                    "initialTimeMs": arguments.clock_initial_ms,
+                    "incrementMs": arguments.clock_increment_ms,
+                    "delayMs": arguments.clock_delay_ms,
+                    "maxDecisionMs": arguments.clock_max_decision_ms,
+                    "reserveMs": arguments.clock_reserve_ms,
+                }
                 headers = (
                     {"x-mtg-api-key": runner.target.engine_api_key}
                     if runner.target.engine_api_key
